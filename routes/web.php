@@ -11,3 +11,8 @@ Route::get('/', function () {
 Route::post('/bot/{slug}/webhook', [WebhookController::class, 'handle'])
     ->middleware('web')
     ->withoutMiddleware([\Illuminate\Foundation\Http\Middleware\ValidateCsrfToken::class]);
+
+
+Route::get('test', function ($slug) {
+    return response()->json(['ok' => true], 200);
+});
