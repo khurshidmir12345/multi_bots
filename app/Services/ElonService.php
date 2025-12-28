@@ -6,6 +6,7 @@ use App\Models\Bot;
 use App\Models\Elon;
 use App\Models\ElonUser;
 use App\Models\Image;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Telegram\Bot\Api;
@@ -336,9 +337,13 @@ class ElonService
         
         if ($imageCount >= 10) {
             $this->sendMessage($message->chat->id, "✅ Maksimum 10 ta rasm yuklashingiz mumkin. Rasmlar yuklandi!");
+            $user->current_step = 'confirm';
+            $user->save();
             $this->askConfirm($message->chat->id, $elon);
         } else {
-            $this->sendMessage($message->chat->id, "📸 Rasm qabul qilindi! ({$imageCount}/10)\n\nYana rasm yuborishingiz yoki \"Tugatish\" deb yozishingiz mumkin.");
+            $text = "📸 Rasm qabul qilindi! ({$imageCount}/10)\n\n";
+            $text .= "Yana rasm yuborishingiz yoki quyidagi tugmani bosishingiz mumkin.";
+            $this->sendMessageWithFinishButton($message->chat->id, $text, $elon->id);
         }
     }
 
@@ -434,10 +439,22 @@ class ElonService
     private function askImages(int $chatId): void
     {
         $text = "📸 *12/13 - Rasmlar*\n\n";
-        $text .= "Mashina rasmlarini yuboring (kamida 1 ta, maksimum 5 ta):\n\n";
+        $text .= "Mashina rasmlarini yuboring (kamida 1 ta, maksimum 10 ta):\n\n";
         $text .= "Rasmlarni birin-ketin yuboring.\n";
-        $text .= "Rasmlar yuklangandan keyin \"Tugatish\" deb yozing.";
-        $this->sendMessage($chatId, $text);
+        $text .= "Rasmlar yuklangandan keyin quyidagi tugmani bosing.";
+        
+        // Faol elon topish
+        $user = ElonUser::where('chat_id', $chatId)->first();
+        $elon = $user ? $user->elonlar()
+            ->where('status', Elon::STATUS_ACCEPTED_USER)
+            ->latest()
+            ->first() : null;
+        
+        if ($elon) {
+            $this->sendMessageWithFinishButton($chatId, $text, $elon->id);
+        } else {
+            $this->sendMessage($chatId, $text);
+        }
     }
 
     private function askConfirm(int $chatId, Elon $elon): void
@@ -465,11 +482,9 @@ class ElonService
         $text .= "📞 *Tel 2*: " . ($elon->tel_2 ?? '-') . "\n";
         $text .= "📍 *Manzil*: " . ($elon->manzil ?? '-') . "\n";
         $text .= "📸 *Rasmlar*: " . $elon->images()->count() . " ta\n\n";
-        $text .= "Barcha ma'lumotlar to'g'rimi?\n\n";
-        $text .= "✅ Yuborish uchun \"Ha\" yozing\n";
-        $text .= "❌ Qayta tahrirlash uchun \"Yo'q\" yozing";
+        $text .= "Barcha ma'lumotlar to'g'rimi?";
 
-        $this->sendMessage($chatId, $text);
+        $this->sendMessageWithConfirmButtons($chatId, $text, $elon->id);
     }
 
     private function sendConfirmation(int $chatId, Elon $elon): void
@@ -517,49 +532,207 @@ class ElonService
     }
 
     /**
-     * Adminlarga rasmlarni yuborish
+     * Adminlarga rasmlarni yuborish (media group sifatida)
      */
     private function sendImagesToAdmin(int $chatId, $images): void
     {
         try {
-            // Agar bir nechta rasm bo'lsa, media group sifatida yuborish
-            if ($images->count() > 1) {
+            $imageCount = $images->count();
+            
+            if ($imageCount === 0) {
+                return;
+            }
+
+            // Barcha rasmlar file_id bilan bo'lsa, SDK orqali yuborish
+            $allHaveFileId = $images->every(function ($image) {
+                return !empty($image->file_id);
+            });
+
+            if ($allHaveFileId && $imageCount > 1) {
+                // SDK orqali media group yuborish (file_id bilan)
                 $media = [];
                 foreach ($images as $index => $image) {
                     if ($index < 10) { // Telegram maksimum 10 ta rasm qabul qiladi
                         $media[] = [
                             'type' => 'photo',
-                            'media' => $image->image_url,
+                            'media' => $image->file_id,
                         ];
                     }
                 }
                 
-                // Birinchi rasmga caption qo'shish
                 if (!empty($media)) {
                     $media[0]['caption'] = "📸 *Elon rasmlari*";
                     $media[0]['parse_mode'] = 'Markdown';
                     
                     $this->telegram->sendMediaGroup([
                         'chat_id' => $chatId,
-                        'media' => $media, // ❗ JSON EMAS, ARRAY
+                        'media' => json_encode($media),
                     ]);
-                }
-            } else {
-                // Agar bitta rasm bo'lsa
-                $image = $images->first();
-                if ($image && $image->image_url) {
-                    $this->telegram->sendPhoto([
-                        'chat_id' => $chatId,
-                        'photo' => $image->image_url,
-                        'caption' => "📸 *Elon rasmi*",
-                        'parse_mode' => 'Markdown',
-                    ]);
+                    return;
                 }
             }
+
+            // Agar file_id bo'lmasa yoki bitta rasm bo'lsa, to'g'ridan-to'g'ri HTTP request yuborish
+            $this->sendMediaGroupDirect($chatId, $images);
+            
         } catch (\Exception $e) {
             Log::error("Error sending images to admin", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+        }
+    }
+
+    /**
+     * To'g'ridan-to'g'ri HTTP request orqali media group yuborish
+     */
+    private function sendMediaGroupDirect(int $chatId, $images): void
+    {
+        $fileHandles = [];
+        
+        try {
+            $apiUrl = "https://api.telegram.org/bot{$this->bot->token}/sendMediaGroup";
+            
+            // Media array'ni tayyorlash
+            $media = [];
+            $multipart = [
+                ['name' => 'chat_id', 'contents' => (string) $chatId],
+            ];
+            
+            $validImages = 0;
+            foreach ($images as $index => $image) {
+                if ($index >= 10) { // Telegram maksimum 10 ta rasm qabul qiladi
+                    break;
+                }
+                
+                $mediaValue = null;
+                $useAttachment = false;
+                
+                // Avval file_id'ni ishlatish
+                if ($image->file_id) {
+                    $mediaValue = $image->file_id;
+                } elseif ($image->local_path && Storage::disk('public')->exists($image->local_path)) {
+                    // Local file yuborish
+                    $fullPath = Storage::disk('public')->path($image->local_path);
+                    
+                    if (file_exists($fullPath)) {
+                        $mediaValue = "attach://photo_{$index}";
+                        $useAttachment = true;
+                        
+                        // Faylni ochish
+                        $fileHandle = fopen($fullPath, 'r');
+                        if ($fileHandle !== false) {
+                            $fileHandles[] = $fileHandle;
+                            
+                            // Multipart uchun fayl qo'shamiz
+                            $multipart[] = [
+                                'name' => "photo_{$index}",
+                                'contents' => $fileHandle,
+                                'filename' => basename($fullPath),
+                            ];
+                        } else {
+                            Log::warning("Failed to open file for media group", [
+                                'image_id' => $image->id,
+                                'path' => $fullPath,
+                            ]);
+                            continue;
+                        }
+                    }
+                } elseif ($image->image_url) {
+                    // URL yuborish
+                    $mediaValue = $image->image_url;
+                }
+                
+                if ($mediaValue) {
+                    $media[] = [
+                        'type' => 'photo',
+                        'media' => $mediaValue,
+                    ];
+                    $validImages++;
+                }
+            }
+            
+            if (empty($media)) {
+                Log::warning("No valid media items for media group", [
+                    'chat_id' => $chatId,
+                ]);
+                return;
+            }
+            
+            // Birinchi rasmga caption qo'shish
+            if (count($media) > 0) {
+                $media[0]['caption'] = "📸 *Elon rasmlari*";
+                $media[0]['parse_mode'] = 'Markdown';
+            }
+            
+            // Media array'ni JSON string sifatida qo'shamiz
+            $multipart[] = [
+                'name' => 'media',
+                'contents' => json_encode($media),
+            ];
+            
+            // Agar bitta rasm bo'lsa, oddiy sendPhoto ishlatish
+            if ($validImages === 1) {
+                // File handle'larni yopish
+                foreach ($fileHandles as $handle) {
+                    fclose($handle);
+                }
+                
+                $image = $images->first();
+                $photo = null;
+                
+                if ($image->file_id) {
+                    $photo = $image->file_id;
+                } elseif ($image->local_path && Storage::disk('public')->exists($image->local_path)) {
+                    $photo = Storage::disk('public')->path($image->local_path);
+                } elseif ($image->image_url) {
+                    $photo = $image->image_url;
+                }
+                
+                if ($photo) {
+                    $this->telegram->sendPhoto([
+                        'chat_id' => $chatId,
+                        'photo' => $photo,
+                        'caption' => "📸 *Elon rasmi*",
+                        'parse_mode' => 'Markdown',
+                    ]);
+                }
+                return;
+            }
+            
+            // HTTP request yuborish
+            $response = Http::asMultipart()->post($apiUrl, $multipart);
+            
+            // File handle'larni yopish
+            foreach ($fileHandles as $handle) {
+                fclose($handle);
+            }
+            
+            if ($response->successful()) {
+                Log::info("Media group sent successfully to admin", [
+                    'chat_id' => $chatId,
+                    'count' => count($media),
+                ]);
+            } else {
+                Log::error("Failed to send media group to admin", [
+                    'chat_id' => $chatId,
+                    'status' => $response->status(),
+                    'response' => $response->body(),
+                ]);
+            }
+        } catch (\Exception $e) {
+            // File handle'larni yopish (xatolik bo'lsa ham)
+            foreach ($fileHandles as $handle) {
+                if (is_resource($handle)) {
+                    fclose($handle);
+                }
+            }
+            
+            Log::error("Error sending media group directly", [
+                'chat_id' => $chatId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
             ]);
         }
     }
@@ -650,27 +823,49 @@ class ElonService
         $data = $callbackQuery->data;
         $messageId = $callbackQuery->message->messageId;
 
-        // Admin ekanligini tekshirish
-        $adminChatIds = config('elon.admin_chat_ids', []);
-        if (!in_array($chatId, $adminChatIds)) {
-            $this->telegram->answerCallbackQuery([
-                'callback_query_id' => $callbackQuery->id,
-                'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
-                'show_alert' => true,
-            ]);
-            return;
-        }
-
         // Callback data'ni parse qilish
         if (str_starts_with($data, 'elon_accept_')) {
+            // Admin callback'lar uchun tekshirish
+            $adminChatIds = config('elon.admin_chat_ids', []);
+            if (!in_array($chatId, $adminChatIds)) {
+                $this->telegram->answerCallbackQuery([
+                    'callback_query_id' => $callbackQuery->id,
+                    'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
+                    'show_alert' => true,
+                ]);
+                return;
+            }
             $elonId = (int) str_replace('elon_accept_', '', $data);
             $this->handleAdminAccept($chatId, $elonId, $callbackQuery->id, $messageId);
         } elseif (str_starts_with($data, 'elon_reject_')) {
+            // Admin callback'lar uchun tekshirish
+            $adminChatIds = config('elon.admin_chat_ids', []);
+            if (!in_array($chatId, $adminChatIds)) {
+                $this->telegram->answerCallbackQuery([
+                    'callback_query_id' => $callbackQuery->id,
+                    'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
+                    'show_alert' => true,
+                ]);
+                return;
+            }
             $elonId = (int) str_replace('elon_reject_', '', $data);
             $this->handleAdminReject($chatId, $elonId, $callbackQuery->id, $messageId);
         } elseif (str_starts_with($data, 'elon_cancel_user_')) {
+            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
             $elonId = (int) str_replace('elon_cancel_user_', '', $data);
             $this->handleUserCancel($chatId, $elonId, $callbackQuery->id, $messageId);
+        } elseif (str_starts_with($data, 'elon_finish_images_')) {
+            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+            $elonId = (int) str_replace('elon_finish_images_', '', $data);
+            $this->handleFinishImages($chatId, $elonId, $callbackQuery->id, $messageId);
+        } elseif (str_starts_with($data, 'elon_confirm_yes_')) {
+            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+            $elonId = (int) str_replace('elon_confirm_yes_', '', $data);
+            $this->handleConfirmYes($chatId, $elonId, $callbackQuery->id, $messageId);
+        } elseif (str_starts_with($data, 'elon_confirm_no_')) {
+            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+            $elonId = (int) str_replace('elon_confirm_no_', '', $data);
+            $this->handleConfirmNo($chatId, $elonId, $callbackQuery->id, $messageId);
         }
     }
 
@@ -921,6 +1116,305 @@ class ElonService
             ]);
             return null;
         }
+    }
+
+    /**
+     * "Tugatish" tugmasi bilan xabar yuborish
+     */
+    private function sendMessageWithFinishButton(int $chatId, string $text, int $elonId): void
+    {
+        try {
+            $keyboard = [
+                'inline_keyboard' => [
+                    [
+                        [
+                            'text' => '✅ Tugatish',
+                            'callback_data' => "elon_finish_images_{$elonId}"
+                        ]
+                    ]
+                ]
+            ];
+
+            $this->telegram->sendMessage([
+                'chat_id' => $chatId,
+                'text' => $text,
+                'parse_mode' => 'Markdown',
+                'reply_markup' => json_encode($keyboard),
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error sending message with finish button", [
+                'chat_id' => $chatId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * "Ha" va "Yo'q" tugmalari bilan tasdiqlash xabari yuborish
+     */
+    private function sendMessageWithConfirmButtons(int $chatId, string $text, int $elonId): void
+    {
+        try {
+            $keyboard = [
+                'inline_keyboard' => [
+                    [
+                        [
+                            'text' => '✅ Ha',
+                            'callback_data' => "elon_confirm_yes_{$elonId}"
+                        ],
+                        [
+                            'text' => '❌ Yo\'q',
+                            'callback_data' => "elon_confirm_no_{$elonId}"
+                        ]
+                    ]
+                ]
+            ];
+
+            $this->telegram->sendMessage([
+                'chat_id' => $chatId,
+                'text' => $text,
+                'parse_mode' => 'Markdown',
+                'reply_markup' => json_encode($keyboard),
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error sending message with confirm buttons", [
+                'chat_id' => $chatId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Rasmlarni tugatish (callback query)
+     */
+    private function handleFinishImages(int $chatId, int $elonId, string $callbackQueryId, int $messageId): void
+    {
+        $elon = Elon::find($elonId);
+        
+        if (!$elon) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon topilmadi!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Foydalanuvchi ekanligini tekshirish
+        if (!$elon->elonUser || $elon->elonUser->chat_id !== $chatId) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Bu sizning eloningiz emas!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Agar rasm bo'lmasa
+        if ($elon->images()->count() === 0) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => '⚠️ Iltimos, kamida 1 ta rasm yuboring!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // User step'ni yangilash
+        $user = $elon->elonUser;
+        $user->current_step = 'confirm';
+        $user->save();
+
+        // Callback query'ga javob
+        $this->telegram->answerCallbackQuery([
+            'callback_query_id' => $callbackQueryId,
+            'text' => 'Rasmlar tugatildi! ✅',
+        ]);
+
+        // Xabarni yangilash
+        $text = "✅ *Rasmlar tugatildi!*\n\n";
+        $text .= "Jami {$elon->images()->count()} ta rasm yuklandi.";
+
+        $this->telegram->editMessageText([
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $text,
+            'parse_mode' => 'Markdown',
+        ]);
+
+        // Confirm'ga o'tish
+        $this->askConfirm($chatId, $elon);
+
+        Log::info("Images finished by user", [
+            'elon_id' => $elonId,
+            'user_chat_id' => $chatId,
+        ]);
+    }
+
+    /**
+     * Tasdiqlash - "Ha" tugmasi bosilganda
+     */
+    private function handleConfirmYes(int $chatId, int $elonId, string $callbackQueryId, int $messageId): void
+    {
+        $elon = Elon::find($elonId);
+        
+        if (!$elon) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon topilmadi!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Foydalanuvchi ekanligini tekshirish
+        if (!$elon->elonUser || $elon->elonUser->chat_id !== $chatId) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Bu sizning eloningiz emas!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Elon statusini yangilash
+        $elon->status = Elon::STATUS_SENDED_TO_ADMIN;
+        $elon->save();
+
+        // User step'ni yangilash
+        $user = $elon->elonUser;
+        $user->current_step = null;
+        $user->save();
+
+        // Callback query'ga javob
+        $this->telegram->answerCallbackQuery([
+            'callback_query_id' => $callbackQueryId,
+            'text' => 'Elon yuborildi! ✅',
+        ]);
+
+        // Xabarni yangilash
+        $text = "✅ *13/13 - Tasdiqlash*\n\n";
+        $text .= "*Elon ma'lumotlari:*\n\n";
+        $text .= "🚗 *Model*: " . ($elon->modeli ?? '-') . "\n";
+        $text .= "⚙️ *Pozitsiya*: " . ($elon->pozitsiyasi ?? '-') . "\n";
+        $text .= "🎨 *Rang*: " . ($elon->rangi ?? '-') . "\n";
+        $text .= "🖌️ *Kraskasi*: " . ($elon->kraskasi ?? '-') . "\n";
+        $text .= "📅 *Yil*: " . ($elon->yili ?? '-') . "\n";
+        $text .= "🛣️ *Yurgani*: " . ($elon->yurgani ? number_format($elon->yurgani, 0, '.', ' ') . ' km' : '-') . "\n";
+        $text .= "⛽ *Yoqilg'i*: " . ($elon->yoqilgisi ?? '-') . "\n";
+        
+        // Narx va valyuta
+        $narxText = '-';
+        if ($elon->narxi) {
+            $currencySymbol = $elon->currency === 'dollar' ? '$' : '';
+            $currencyText = $elon->currency === 'dollar' ? ' dollar' : ' so\'m';
+            $narxText = $currencySymbol . number_format($elon->narxi, 0, '.', ' ') . $currencyText;
+        }
+        $text .= "💰 *Narx*: " . $narxText . "\n";
+        
+        $text .= "📞 *Tel 1*: " . ($elon->tel_1 ?? '-') . "\n";
+        $text .= "📞 *Tel 2*: " . ($elon->tel_2 ?? '-') . "\n";
+        $text .= "📍 *Manzil*: " . ($elon->manzil ?? '-') . "\n";
+        $text .= "📸 *Rasmlar*: " . $elon->images()->count() . " ta\n\n";
+        $text .= "✅ *Tasdiqlandi va yuborildi!*";
+
+        $this->telegram->editMessageText([
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $text,
+            'parse_mode' => 'Markdown',
+        ]);
+
+        // Adminlarga elon yuborish
+        $this->sendToAdmins($elon);
+        
+        // Foydalanuvchiga tasdiqlash xabari
+        $this->sendConfirmation($chatId, $elon);
+
+        Log::info("Elon confirmed and sent by user", [
+            'elon_id' => $elonId,
+            'user_chat_id' => $chatId,
+        ]);
+    }
+
+    /**
+     * Tasdiqlash - "Yo'q" tugmasi bosilganda
+     */
+    private function handleConfirmNo(int $chatId, int $elonId, string $callbackQueryId, int $messageId): void
+    {
+        $elon = Elon::find($elonId);
+        
+        if (!$elon) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon topilmadi!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Foydalanuvchi ekanligini tekshirish
+        if (!$elon->elonUser || $elon->elonUser->chat_id !== $chatId) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Bu sizning eloningiz emas!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // User step'ni yangilash
+        $user = $elon->elonUser;
+        $user->current_step = 'modeli';
+        $user->save();
+
+        // Callback query'ga javob
+        $this->telegram->answerCallbackQuery([
+            'callback_query_id' => $callbackQueryId,
+            'text' => 'Qayta tahrirlash boshlandi! 🔄',
+        ]);
+
+        // Xabarni yangilash
+        $text = "✅ *13/13 - Tasdiqlash*\n\n";
+        $text .= "*Elon ma'lumotlari:*\n\n";
+        $text .= "🚗 *Model*: " . ($elon->modeli ?? '-') . "\n";
+        $text .= "⚙️ *Pozitsiya*: " . ($elon->pozitsiyasi ?? '-') . "\n";
+        $text .= "🎨 *Rang*: " . ($elon->rangi ?? '-') . "\n";
+        $text .= "🖌️ *Kraskasi*: " . ($elon->kraskasi ?? '-') . "\n";
+        $text .= "📅 *Yil*: " . ($elon->yili ?? '-') . "\n";
+        $text .= "🛣️ *Yurgani*: " . ($elon->yurgani ? number_format($elon->yurgani, 0, '.', ' ') . ' km' : '-') . "\n";
+        $text .= "⛽ *Yoqilg'i*: " . ($elon->yoqilgisi ?? '-') . "\n";
+        
+        // Narx va valyuta
+        $narxText = '-';
+        if ($elon->narxi) {
+            $currencySymbol = $elon->currency === 'dollar' ? '$' : '';
+            $currencyText = $elon->currency === 'dollar' ? ' dollar' : ' so\'m';
+            $narxText = $currencySymbol . number_format($elon->narxi, 0, '.', ' ') . $currencyText;
+        }
+        $text .= "💰 *Narx*: " . $narxText . "\n";
+        
+        $text .= "📞 *Tel 1*: " . ($elon->tel_1 ?? '-') . "\n";
+        $text .= "📞 *Tel 2*: " . ($elon->tel_2 ?? '-') . "\n";
+        $text .= "📍 *Manzil*: " . ($elon->manzil ?? '-') . "\n";
+        $text .= "📸 *Rasmlar*: " . $elon->images()->count() . " ta\n\n";
+        $text .= "🔄 *Qayta tahrirlash boshlandi*";
+
+        $this->telegram->editMessageText([
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $text,
+            'parse_mode' => 'Markdown',
+        ]);
+
+        // Qayta tahrirlashni boshlash
+        $this->sendMessage($chatId, "🔄 Qayta tahrirlashni boshlaymiz...");
+        $this->askModeli($chatId);
+
+        Log::info("Elon editing restarted by user", [
+            'elon_id' => $elonId,
+            'user_chat_id' => $chatId,
+        ]);
     }
 
     /**
