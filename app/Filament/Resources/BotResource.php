@@ -34,9 +34,21 @@ class BotResource extends Resource
                 Forms\Components\TextInput::make('slug')
                     ->required()
                     ->maxLength(255),
+                Forms\Components\Select::make('type')
+                    ->label('Bot Type')
+                    ->options([
+                        'cleaner' => 'Cleaner Bot',
+                        'elon' => 'Elon Bot',
+                    ])
+                    ->default('cleaner')
+                    ->required(),
                 Forms\Components\TextInput::make('token')
                     ->required()
                     ->maxLength(255),
+                Forms\Components\TextInput::make('channel_id')
+                    ->label('Channel ID')
+                    ->maxLength(255)
+                    ->default(null),
                 Forms\Components\TextInput::make('name')
                     ->maxLength(255)
                     ->default(null),
@@ -62,6 +74,11 @@ class BotResource extends Resource
                     ->label('Nomi')
                     ->searchable()
                     ->sortable(),
+                Tables\Columns\TextColumn::make('channel_id')
+                    ->label('Channel ID')
+                    ->searchable()
+                    ->sortable()
+                    ->toggleable(),
                 Tables\Columns\IconColumn::make('is_active')
                     ->label('Holat')
                     ->boolean()
@@ -98,7 +115,19 @@ class BotResource extends Resource
                     ->modalDescription('Bu bot uchun Telegram webhook o\'rnatiladi. Davom etasizmi?')
                     ->action(function (Bot $record) {
                         try {
+                            // Webhook URL'ni aniqlash
+                            // Agar webhook_url bo'sh bo'lsa yoki elon bot uchun to'g'ri URL emas bo'lsa, yangilash
+                            $appUrl = config('app.url');
+                            $slug = $record->slug;
+                            
+                            // Elon bot ekanligini tekshirish (slug nomiga qarab yoki boshqa usul)
+                            // Hozircha barcha botlar uchun ikki xil URL yaratamiz va tekshiramiz
+                            // Yoki webhook_url'ni qo'lda o'zgartirish mumkin
+                            
                             $url = $record->webhook_url;
+                            
+                            // Agar webhook_url `/elon/webhook` ni o'z ichiga olmasa va elon bot bo'lsa
+                            // Lekin hozircha barcha botlar uchun webhook_url'ni qo'lda o'zgartirish kerak
                             
                             if (!$url) {
                                 Notification::make()

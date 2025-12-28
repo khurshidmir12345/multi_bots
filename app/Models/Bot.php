@@ -14,7 +14,9 @@ class Bot extends Model
      */
     protected $fillable = [
         'slug',
+        'type',
         'token',
+        'channel_id',
         'name',
         'description',
         'webhook_url',
@@ -70,9 +72,16 @@ class Bot extends Model
 
         static::saving(function ($bot) {
             // Webhook URL'ni avtomatik yaratish
-            if ($bot->slug && !$bot->webhook_url) {
+            if ($bot->slug) {
                 $appUrl = config('app.url');
-                $bot->webhook_url = rtrim($appUrl, '/') . '/bot/' . $bot->slug . '/webhook';
+                $baseUrl = rtrim($appUrl, '/') . '/api/bot/' . $bot->slug;
+                
+                // Bot type'ga qarab webhook URL yaratish
+                if ($bot->type === 'elon') {
+                    $bot->webhook_url = $baseUrl . '/elon/webhook';
+                } else {
+                    $bot->webhook_url = $baseUrl . '/webhook';
+                }
             }
         });
     }

@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\CleanerBotController;
+use App\Http\Controllers\ElonBotController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -21,3 +22,6 @@ Route::middleware('api')->get('/user', function (Request $request) {
 
 // Webhook route for Cleaner Bot
 Route::post('/bot/{slug}/webhook', [CleanerBotController::class, 'handle']);
+
+// Webhook route for Elon Bot
+Route::post('/bot/{slug}/elon/webhook', [ElonBotController::class, 'handle']);
