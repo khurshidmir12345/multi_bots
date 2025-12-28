@@ -38,6 +38,8 @@ class Elon extends Model
         'tel_2',
         'manzil',
         'status',
+        'cancelled_from_admin',
+        'cancelled_from_user',
     ];
 
     /**
@@ -50,6 +52,8 @@ class Elon extends Model
         'yili' => 'integer',
         'yurgani' => 'integer',
         'narxi' => 'decimal:2',
+        'cancelled_from_admin' => 'boolean',
+        'cancelled_from_user' => 'boolean',
     ];
 
     /**

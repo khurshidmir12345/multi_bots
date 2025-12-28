@@ -7,6 +7,7 @@ use App\Models\Elon;
 use App\Models\ElonUser;
 use App\Models\Image;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Telegram\Bot\Api;
 use Telegram\Bot\Objects\Message;
 use Telegram\Bot\Objects\Update;
@@ -313,9 +314,13 @@ class ElonService
 
         // Eng katta rasm olish
         $photo = collect($message->photo)->sortByDesc('file_size')->first();
-        $file = $this->telegram->getFile(['file_id' => $photo['file_id']]);
+        $fileId = $photo['file_id'];
+        $file = $this->telegram->getFile(['file_id' => $fileId]);
         $filePath = $file->filePath;
         $fileUrl = "https://api.telegram.org/file/bot{$this->bot->token}/{$filePath}";
+
+        // Rasmni Telegram'dan yuklab olish va local storage'ga saqlash
+        $localPath = $this->downloadAndSaveImage($fileUrl, $filePath, $elon->id);
 
         // Rasmni saqlash
         Image::create([
@@ -323,6 +328,8 @@ class ElonService
             'elon_id' => $elon->id,
             'image_url' => $fileUrl,
             'image_path' => $filePath,
+            'file_id' => $fileId,
+            'local_path' => $localPath,
         ]);
 
         $imageCount = $elon->images()->count();
@@ -534,7 +541,7 @@ class ElonService
                     
                     $this->telegram->sendMediaGroup([
                         'chat_id' => $chatId,
-                        'media' => json_encode($media),
+                        'media' => $media, // ❗ JSON EMAS, ARRAY
                     ]);
                 }
             } else {
@@ -661,6 +668,9 @@ class ElonService
         } elseif (str_starts_with($data, 'elon_reject_')) {
             $elonId = (int) str_replace('elon_reject_', '', $data);
             $this->handleAdminReject($chatId, $elonId, $callbackQuery->id, $messageId);
+        } elseif (str_starts_with($data, 'elon_cancel_user_')) {
+            $elonId = (int) str_replace('elon_cancel_user_', '', $data);
+            $this->handleUserCancel($chatId, $elonId, $callbackQuery->id, $messageId);
         }
     }
 
@@ -711,12 +721,30 @@ class ElonService
             'parse_mode' => 'Markdown',
         ]);
 
-        // Foydalanuvchiga xabar yuborish
+        // Foydalanuvchiga xabar yuborish (button bilan)
         if ($elon->elonUser) {
             $userText = "✅ *Elon tasdiqlandi!*\n\n";
             $userText .= "Elon ID: #{$elon->id}\n\n";
-            $userText .= "Elon kanalga joylashtiriladi.";
-            $this->sendMessage($elon->elonUser->chat_id, $userText);
+            $userText .= "Elon kanalga yuboriladi.\n\n";
+            $userText .= "Agar elonni bekor qilmoqchi bo'lsangiz, quyidagi tugmani bosing.";
+            
+            $keyboard = [
+                'inline_keyboard' => [
+                    [
+                        [
+                            'text' => '❌ Elonni bekor qilish',
+                            'callback_data' => "elon_cancel_user_{$elon->id}"
+                        ]
+                    ]
+                ]
+            ];
+            
+            $this->telegram->sendMessage([
+                'chat_id' => $elon->elonUser->chat_id,
+                'text' => $userText,
+                'parse_mode' => 'Markdown',
+                'reply_markup' => json_encode($keyboard),
+            ]);
         }
 
         Log::info("Elon accepted by admin", [
@@ -743,6 +771,7 @@ class ElonService
 
         // Elon statusini yangilash
         $elon->status = Elon::STATUS_ENDED;
+        $elon->cancelled_from_admin = true;
         $elon->save();
 
         // Callback query'ga javob
@@ -774,6 +803,124 @@ class ElonService
             'elon_id' => $elonId,
             'admin_chat_id' => $adminChatId,
         ]);
+    }
+
+    /**
+     * Foydalanuvchi tomonidan elonni bekor qilish
+     */
+    private function handleUserCancel(int $userChatId, int $elonId, string $callbackQueryId, int $messageId): void
+    {
+        $elon = Elon::find($elonId);
+        
+        if (!$elon) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon topilmadi!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Foydalanuvchi ekanligini tekshirish
+        if ($elon->elonUser->chat_id !== $userChatId) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Bu sizning eloningiz emas!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Agar elon allaqachon kanalga chiqgan bo'lsa (complated status)
+        if ($elon->status === Elon::STATUS_COMPLATED) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon allaqachon kanalga chiqgan, bekor qilish mumkin emas!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Agar allaqachon bekor qilingan bo'lsa
+        if ($elon->cancelled_from_user || $elon->cancelled_from_admin) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon allaqachon bekor qilingan!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Elon statusini yangilash
+        $elon->status = Elon::STATUS_ENDED;
+        $elon->cancelled_from_user = true;
+        $elon->save();
+
+        // Callback query'ga javob
+        $this->telegram->answerCallbackQuery([
+            'callback_query_id' => $callbackQueryId,
+            'text' => 'Elon bekor qilindi! ✅',
+        ]);
+
+        // Xabarni yangilash
+        $text = "✅ *Elon tasdiqlandi!*\n\n";
+        $text .= "Elon ID: #{$elon->id}\n\n";
+        $text .= "❌ *Elon bekor qilindi* (Siz tomoningizdan)";
+
+        $this->telegram->editMessageText([
+            'chat_id' => $userChatId,
+            'message_id' => $messageId,
+            'text' => $text,
+            'parse_mode' => 'Markdown',
+        ]);
+
+        Log::info("Elon cancelled by user", [
+            'elon_id' => $elonId,
+            'user_chat_id' => $userChatId,
+        ]);
+    }
+
+    /**
+     * Telegram'dan rasmni yuklab olish va local storage'ga saqlash
+     */
+    private function downloadAndSaveImage(string $fileUrl, string $filePath, int $elonId): ?string
+    {
+        try {
+            // Rasmni yuklab olish
+            $imageContent = file_get_contents($fileUrl);
+            
+            if ($imageContent === false) {
+                Log::error("Failed to download image from Telegram", [
+                    'file_url' => $fileUrl,
+                    'file_path' => $filePath,
+                ]);
+                return null;
+            }
+
+            // File extension olish
+            $extension = pathinfo($filePath, PATHINFO_EXTENSION);
+            if (empty($extension)) {
+                $extension = 'jpg'; // Default extension
+            }
+
+            // Storage path yaratish: elons/{elon_id}/{timestamp}_{random}.{ext}
+            $fileName = time() . '_' . uniqid() . '.' . $extension;
+            $storagePath = "elons/{$elonId}/{$fileName}";
+
+            // Public disk'ga saqlash
+            Storage::disk('public')->put($storagePath, $imageContent);
+
+            // To'liq path qaytarish
+            return $storagePath;
+        } catch (\Exception $e) {
+            Log::error("Error downloading and saving image", [
+                'file_url' => $fileUrl,
+                'file_path' => $filePath,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return null;
+        }
     }
 
     /**

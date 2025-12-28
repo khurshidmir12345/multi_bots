@@ -21,6 +21,12 @@ return Application::configure(basePath: dirname(__DIR__))
             ->at('02:00')
             ->timezone('Asia/Tashkent')
             ->withoutOverlapping();
+        
+        // Har soatda bir marta elonlarni kanalga yuborish
+        $schedule->command('elons:send-to-channel')
+            ->hourly()
+            ->timezone('Asia/Tashkent')
+            ->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

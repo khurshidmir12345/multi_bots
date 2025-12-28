@@ -24,6 +24,8 @@ class Image extends Model
         'elon_id',
         'image_url',
         'image_path',
+        'file_id',
+        'local_path',
     ];
 
     /**
