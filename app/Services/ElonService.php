@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\SendElonToChannelJob;
 use App\Models\Bot;
 use App\Models\Elon;
 use App\Models\ElonUser;
@@ -313,6 +314,15 @@ class ElonService
             return;
         }
 
+        // Avval rasm sonini tekshirish
+        $imageCount = $elon->images()->count();
+        
+        // Agar 4 ta rasm bo'lsa, 5-chi rasmni qabul qilmaymiz
+        if ($imageCount >= 4) {
+            $this->sendMessage($message->chat->id, "❌ Xatolik! Maksimum 4 ta rasm yuklashingiz mumkin. Siz allaqachon {$imageCount} ta rasm yuklagansiz.");
+            return;
+        }
+
         // Eng katta rasm olish
         $photo = collect($message->photo)->sortByDesc('file_size')->first();
         $fileId = $photo['file_id'];
@@ -335,13 +345,13 @@ class ElonService
 
         $imageCount = $elon->images()->count();
         
-        if ($imageCount >= 10) {
-            $this->sendMessage($message->chat->id, "✅ Maksimum 10 ta rasm yuklashingiz mumkin. Rasmlar yuklandi!");
+        if ($imageCount >= 4) {
+            $this->sendMessage($message->chat->id, "✅ Maksimum 4 ta rasm yuklashingiz mumkin. Rasmlar yuklandi!");
             $user->current_step = 'confirm';
             $user->save();
             $this->askConfirm($message->chat->id, $elon);
         } else {
-            $text = "📸 Rasm qabul qilindi! ({$imageCount}/10)\n\n";
+            $text = "📸 Rasm qabul qilindi! ({$imageCount}/4)\n\n";
             $text .= "Yana rasm yuborishingiz yoki quyidagi tugmani bosishingiz mumkin.";
             $this->sendMessageWithFinishButton($message->chat->id, $text, $elon->id);
         }
@@ -439,9 +449,8 @@ class ElonService
     private function askImages(int $chatId): void
     {
         $text = "📸 *12/13 - Rasmlar*\n\n";
-        $text .= "Mashina rasmlarini yuboring (kamida 1 ta, maksimum 10 ta):\n\n";
-        $text .= "Rasmlarni birin-ketin yuboring.\n";
-        $text .= "Rasmlar yuklangandan keyin quyidagi tugmani bosing.";
+        $text .= "Mashina rasmlarini yuboring (kamida 1 ta, maksimum 4 ta):\n\n";
+        $text .= "Rasmlarni birin-ketin yuboring.";
         
         // Faol elon topish
         $user = ElonUser::where('chat_id', $chatId)->first();
@@ -450,9 +459,12 @@ class ElonService
             ->latest()
             ->first() : null;
         
-        if ($elon) {
+        // Agar elon bo'lsa va rasm bo'lsa, button bilan yuborish
+        if ($elon && $elon->images()->count() > 0) {
+            $text .= "\n\nRasmlar yuklangandan keyin quyidagi tugmani bosing.";
             $this->sendMessageWithFinishButton($chatId, $text, $elon->id);
         } else {
+            // Agar rasm bo'lmasa, button'siz yuborish
             $this->sendMessage($chatId, $text);
         }
     }
@@ -916,11 +928,31 @@ class ElonService
             'parse_mode' => 'Markdown',
         ]);
 
+        // Darhol kanalga yuborish
+        try {
+            $job = new SendElonToChannelJob($elon->id, $this->bot->id);
+            $job->handle(); // To'g'ridan-to'g'ri chaqirish (zahoti yuborish uchun)
+            
+            Log::info("Elon sent to channel immediately after admin acceptance", [
+                'elon_id' => $elonId,
+                'bot_id' => $this->bot->id,
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error sending elon to channel after admin acceptance", [
+                'elon_id' => $elonId,
+                'bot_id' => $this->bot->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            
+            // Xatolik bo'lsa ham, foydalanuvchiga xabar yuboramiz
+        }
+
         // Foydalanuvchiga xabar yuborish (button bilan)
         if ($elon->elonUser) {
             $userText = "✅ *Elon tasdiqlandi!*\n\n";
             $userText .= "Elon ID: #{$elon->id}\n\n";
-            $userText .= "Elon kanalga yuboriladi.\n\n";
+            $userText .= "Elon kanalga yuborildi.\n\n";
             $userText .= "Agar elonni bekor qilmoqchi bo'lsangiz, quyidagi tugmani bosing.";
             
             $keyboard = [
