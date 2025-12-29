@@ -188,14 +188,20 @@ class ElonService
 
             case 'yurgani':
                 $yurgani = (int) preg_replace('/[^0-9]/', '', $text);
-                if ($yurgani > 0) {
+                // Maksimal qiymat: 999,999,999 km (1 milliard km - juda ko'p, lekin realistik)
+                $maxYurgani = 999999999;
+                if ($yurgani > 0 && $yurgani <= $maxYurgani) {
                     $elon->yurgani = $yurgani;
                     $elon->save();
                     $user->current_step = 'yoqilgisi';
                     $user->save();
                     $this->askYoqilgisi($message->chat->id);
                 } else {
-                    $this->sendMessage($message->chat->id, "❌ Noto'g'ri masofa! Iltimos, raqam kiriting (masalan: 50000)");
+                    if ($yurgani > $maxYurgani) {
+                        $this->sendMessage($message->chat->id, "❌ Masofa juda katta! Iltimos, 999,999,999 km dan kichikroq raqam kiriting (masalan: 50000)");
+                    } else {
+                        $this->sendMessage($message->chat->id, "❌ Noto'g'ri masofa! Iltimos, raqam kiriting (masalan: 50000)");
+                    }
                 }
                 break;
 
@@ -330,8 +336,8 @@ class ElonService
         $filePath = $file->filePath;
         $fileUrl = "https://api.telegram.org/file/bot{$this->bot->token}/{$filePath}";
 
-        // Rasmni Telegram'dan yuklab olish va local storage'ga saqlash
-        $localPath = $this->downloadAndSaveImage($fileUrl, $filePath, $elon->id);
+        // Rasmni Telegram'dan yuklab olish va S3'ga saqlash
+        $s3Data = $this->downloadAndSaveImage($fileUrl, $filePath, $elon->id);
 
         // Rasmni saqlash
         Image::create([
@@ -340,7 +346,8 @@ class ElonService
             'image_url' => $fileUrl,
             'image_path' => $filePath,
             'file_id' => $fileId,
-            'local_path' => $localPath,
+            's3_path' => $s3Data['s3_path'],
+            's3_url' => $s3Data['s3_url'],
         ]);
 
         // Elon'ni refresh qilish (yangi saqlangan rasmni hisobga olish uchun)
@@ -528,13 +535,15 @@ class ElonService
 
         foreach ($adminChatIds as $adminChatId) {
             try {
-                // Avval rasmlarni yuborish
+                // Avval rasmlarni elon matni bilan yuborish
                 if ($images->isNotEmpty()) {
-                    $this->sendImagesToAdmin((int) $adminChatId, $images);
+                    $this->sendImagesToAdmin((int) $adminChatId, $images, $elonText);
+                    // Keyin button'lar bilan alohida xabar yuborish
+                    $this->sendButtonsOnly((int) $adminChatId, $elon->id);
+                } else {
+                    // Agar rasm bo'lmasa, faqat text yuborish
+                    $this->sendMessageWithButtons((int) $adminChatId, $elonText, $elon->id);
                 }
-                
-                // Keyin text va button'lar bilan yuborish
-                $this->sendMessageWithButtons((int) $adminChatId, $elonText, $elon->id);
             } catch (\Exception $e) {
                 Log::error("Error sending elon to admin", [
                     'admin_chat_id' => $adminChatId,
@@ -548,13 +557,21 @@ class ElonService
     /**
      * Adminlarga rasmlarni yuborish (media group sifatida)
      */
-    private function sendImagesToAdmin(int $chatId, $images): void
+    private function sendImagesToAdmin(int $chatId, $images, string $caption = ''): void
     {
         try {
             $imageCount = $images->count();
             
             if ($imageCount === 0) {
                 return;
+            }
+
+            // Caption'ni tayyorlash (elon matni yoki default)
+            $finalCaption = !empty($caption) ? $caption : "📸 *Elon rasmlari*";
+            
+            // Telegram caption limit: 1024 belgi
+            if (mb_strlen($finalCaption) > 1024) {
+                $finalCaption = mb_substr($finalCaption, 0, 1020) . '...';
             }
 
             // Barcha rasmlar file_id bilan bo'lsa, SDK orqali yuborish
@@ -575,7 +592,7 @@ class ElonService
                 }
                 
                 if (!empty($media)) {
-                    $media[0]['caption'] = "📸 *Elon rasmlari*";
+                    $media[0]['caption'] = $finalCaption;
                     $media[0]['parse_mode'] = 'Markdown';
                     
                     $this->telegram->sendMediaGroup([
@@ -587,7 +604,7 @@ class ElonService
             }
 
             // Agar file_id bo'lmasa yoki bitta rasm bo'lsa, to'g'ridan-to'g'ri HTTP request yuborish
-            $this->sendMediaGroupDirect($chatId, $images);
+            $this->sendMediaGroupDirect($chatId, $images, $finalCaption);
             
         } catch (\Exception $e) {
             Log::error("Error sending images to admin", [
@@ -601,7 +618,7 @@ class ElonService
     /**
      * To'g'ridan-to'g'ri HTTP request orqali media group yuborish
      */
-    private function sendMediaGroupDirect(int $chatId, $images): void
+    private function sendMediaGroupDirect(int $chatId, $images, string $caption = ''): void
     {
         $fileHandles = [];
         
@@ -626,16 +643,22 @@ class ElonService
                 // Avval file_id'ni ishlatish
                 if ($image->file_id) {
                     $mediaValue = $image->file_id;
-                } elseif ($image->local_path && Storage::disk('public')->exists($image->local_path)) {
-                    // Local file yuborish
-                    $fullPath = Storage::disk('public')->path($image->local_path);
-                    
-                    if (file_exists($fullPath)) {
+                } elseif ($image->s3_url) {
+                    // S3 URL'ni ishlatish
+                    $mediaValue = $image->s3_url;
+                } elseif ($image->s3_path && Storage::disk('s3')->exists($image->s3_path)) {
+                    // S3'dan faylni yuklab olish va yuborish
+                    try {
+                        $fileContent = Storage::disk('s3')->get($image->s3_path);
+                        $tempFile = tmpfile();
+                        $tempPath = stream_get_meta_data($tempFile)['uri'];
+                        file_put_contents($tempPath, $fileContent);
+                        
                         $mediaValue = "attach://photo_{$index}";
                         $useAttachment = true;
                         
                         // Faylni ochish
-                        $fileHandle = fopen($fullPath, 'r');
+                        $fileHandle = fopen($tempPath, 'r');
                         if ($fileHandle !== false) {
                             $fileHandles[] = $fileHandle;
                             
@@ -643,18 +666,25 @@ class ElonService
                             $multipart[] = [
                                 'name' => "photo_{$index}",
                                 'contents' => $fileHandle,
-                                'filename' => basename($fullPath),
+                                'filename' => basename($image->s3_path),
                             ];
                         } else {
-                            Log::warning("Failed to open file for media group", [
+                            Log::warning("Failed to open temp file for media group", [
                                 'image_id' => $image->id,
-                                'path' => $fullPath,
+                                's3_path' => $image->s3_path,
                             ]);
                             continue;
                         }
+                    } catch (\Exception $e) {
+                        Log::error("Error getting file from S3", [
+                            'image_id' => $image->id,
+                            's3_path' => $image->s3_path,
+                            'error' => $e->getMessage(),
+                        ]);
+                        continue;
                     }
                 } elseif ($image->image_url) {
-                    // URL yuborish
+                    // Telegram URL'ni ishlatish
                     $mediaValue = $image->image_url;
                 }
                 
@@ -675,8 +705,10 @@ class ElonService
             }
             
             // Birinchi rasmga caption qo'shish
-            if (count($media) > 0) {
-                $media[0]['caption'] = "📸 *Elon rasmlari*";
+            if (count($media) > 0 && !empty($caption)) {
+                // Telegram caption limit: 1024 belgi
+                $finalCaption = mb_strlen($caption) > 1024 ? mb_substr($caption, 0, 1020) . '...' : $caption;
+                $media[0]['caption'] = $finalCaption;
                 $media[0]['parse_mode'] = 'Markdown';
             }
             
@@ -698,17 +730,39 @@ class ElonService
                 
                 if ($image->file_id) {
                     $photo = $image->file_id;
-                } elseif ($image->local_path && Storage::disk('public')->exists($image->local_path)) {
-                    $photo = Storage::disk('public')->path($image->local_path);
+                } elseif ($image->s3_url) {
+                    $photo = $image->s3_url;
+                } elseif ($image->s3_path && Storage::disk('s3')->exists($image->s3_path)) {
+                    // S3'dan faylni yuklab olish
+                    try {
+                        $fileContent = Storage::disk('s3')->get($image->s3_path);
+                        $tempFile = tmpfile();
+                        $tempPath = stream_get_meta_data($tempFile)['uri'];
+                        file_put_contents($tempPath, $fileContent);
+                        $photo = $tempPath;
+                    } catch (\Exception $e) {
+                        Log::error("Error getting file from S3 for single photo", [
+                            'image_id' => $image->id,
+                            's3_path' => $image->s3_path,
+                            'error' => $e->getMessage(),
+                        ]);
+                        $photo = $image->image_url;
+                    }
                 } elseif ($image->image_url) {
                     $photo = $image->image_url;
                 }
                 
                 if ($photo) {
+                    $photoCaption = !empty($caption) ? $caption : "📸 *Elon rasmi*";
+                    // Telegram caption limit: 1024 belgi
+                    if (mb_strlen($photoCaption) > 1024) {
+                        $photoCaption = mb_substr($photoCaption, 0, 1020) . '...';
+                    }
+                    
                     $this->telegram->sendPhoto([
                         'chat_id' => $chatId,
                         'photo' => $photo,
-                        'caption' => "📸 *Elon rasmi*",
+                        'caption' => $photoCaption,
                         'parse_mode' => 'Markdown',
                     ]);
                 }
@@ -829,6 +883,41 @@ class ElonService
     }
 
     /**
+     * Faqat button'lar bilan xabar yuborish (rasmlar bilan caption yuborilganda)
+     */
+    private function sendButtonsOnly(int $chatId, int $elonId): void
+    {
+        try {
+            $keyboard = [
+                'inline_keyboard' => [
+                    [
+                        [
+                            'text' => '✅ Tasdiqlash',
+                            'callback_data' => "elon_accept_{$elonId}"
+                        ],
+                        [
+                            'text' => '❌ Rad etish',
+                            'callback_data' => "elon_reject_{$elonId}"
+                        ]
+                    ]
+                ]
+            ];
+
+            $this->telegram->sendMessage([
+                'chat_id' => $chatId,
+                'text' => '⬆️ *Yuqoridagi elonni tasdiqlang yoki rad eting*',
+                'parse_mode' => 'Markdown',
+                'reply_markup' => json_encode($keyboard),
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error sending buttons only", [
+                'chat_id' => $chatId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
      * Callback query'ni handle qilish
      */
     private function handleCallbackQuery($callbackQuery): void
@@ -930,24 +1019,21 @@ class ElonService
             'parse_mode' => 'Markdown',
         ]);
 
-        // Darhol kanalga yuborish
+        // Queue'ga qo'yish (vaqt olmasligi uchun)
         try {
-            $job = new SendElonToChannelJob($elon->id, $this->bot->id);
-            $job->handle(); // To'g'ridan-to'g'ri chaqirish (zahoti yuborish uchun)
+            SendElonToChannelJob::dispatch($elon->id, $this->bot->id);
             
-            Log::info("Elon sent to channel immediately after admin acceptance", [
+            Log::info("Elon queued to channel after admin acceptance", [
                 'elon_id' => $elonId,
                 'bot_id' => $this->bot->id,
             ]);
         } catch (\Exception $e) {
-            Log::error("Error sending elon to channel after admin acceptance", [
+            Log::error("Error queueing elon to channel after admin acceptance", [
                 'elon_id' => $elonId,
                 'bot_id' => $this->bot->id,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
-            
-            // Xatolik bo'lsa ham, foydalanuvchiga xabar yuboramiz
         }
 
         // Foydalanuvchiga xabar yuborish (button bilan)
@@ -1110,9 +1196,9 @@ class ElonService
     }
 
     /**
-     * Telegram'dan rasmni yuklab olish va local storage'ga saqlash
+     * Telegram'dan rasmni yuklab olish va S3'ga saqlash
      */
-    private function downloadAndSaveImage(string $fileUrl, string $filePath, int $elonId): ?string
+    private function downloadAndSaveImage(string $fileUrl, string $filePath, int $elonId): array
     {
         try {
             // Rasmni HTTP client orqali yuklab olish (timeout bilan)
@@ -1124,7 +1210,7 @@ class ElonService
                     'file_path' => $filePath,
                     'status' => $response->status(),
                 ]);
-                return null;
+                return ['s3_path' => null, 's3_url' => null];
             }
             
             $imageContent = $response->body();
@@ -1134,7 +1220,7 @@ class ElonService
                     'file_url' => $fileUrl,
                     'file_path' => $filePath,
                 ]);
-                return null;
+                return ['s3_path' => null, 's3_url' => null];
             }
 
             // File extension olish
@@ -1147,19 +1233,31 @@ class ElonService
             $fileName = time() . '_' . uniqid() . '.' . $extension;
             $storagePath = "elons/{$elonId}/{$fileName}";
 
-            // Public disk'ga saqlash
-            Storage::disk('public')->put($storagePath, $imageContent);
+            // S3 disk'ga saqlash
+            Storage::disk('s3')->put($storagePath, $imageContent);
 
-            // To'liq path qaytarish
-            return $storagePath;
+            // S3 URL'ni olish - to'g'ridan-to'g'ri URL yaratish
+            $awsUrl = config('filesystems.disks.s3.url', '');
+            $s3Url = $awsUrl ? rtrim($awsUrl, '/') . '/' . $storagePath : null;
+
+            Log::info("Image saved to S3", [
+                'elon_id' => $elonId,
+                's3_path' => $storagePath,
+                's3_url' => $s3Url,
+            ]);
+
+            return [
+                's3_path' => $storagePath,
+                's3_url' => $s3Url,
+            ];
         } catch (\Exception $e) {
-            Log::error("Error downloading and saving image", [
+            Log::error("Error downloading and saving image to S3", [
                 'file_url' => $fileUrl,
                 'file_path' => $filePath,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
-            return null;
+            return ['s3_path' => null, 's3_url' => null];
         }
     }
 

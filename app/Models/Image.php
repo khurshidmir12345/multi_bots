@@ -25,7 +25,9 @@ class Image extends Model
         'image_url',
         'image_path',
         'file_id',
-        'local_path',
+        'local_path', // Eski ma'lumotlar uchun qoldirilgan
+        's3_path',
+        's3_url',
     ];
 
     /**

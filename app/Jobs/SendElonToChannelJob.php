@@ -9,6 +9,8 @@ use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Http;
+use Intervention\Image\ImageManager;
+use Intervention\Image\Drivers\Gd\Driver;
 use Telegram\Bot\Api;
 use Telegram\Bot\FileUpload\InputFile;
 
@@ -165,20 +167,16 @@ class SendElonToChannelJob implements ShouldQueue
     }
 
     /**
-     * Rasmlarni kanalga yuborish
+     * Rasmlarni kanalga yuborish (Media Group yoki bitta rasm)
      */
     private function sendImagesToChannel(Api $telegram, string $channelId, $images, string $caption, string $botToken): void
     {
         try {
-            // Faqat local_path bo'lgan rasmlarni ajratish (o'zimizda saqlangan fayllar)
-            $validImages = $images->filter(function ($image) {
-                return !empty($image->local_path);
-            });
-
-            if ($validImages->isEmpty()) {
-                Log::warning("SendElonToChannelJob: No valid images found, sending text only", [
+            $imageCount = $images->count();
+            
+            if ($imageCount === 0) {
+                Log::warning("SendElonToChannelJob: No images found, sending text only", [
                     'elon_id' => $this->elonId,
-                    'images_count' => $images->count(),
                 ]);
                 
                 $telegram->sendMessage([
@@ -189,22 +187,62 @@ class SendElonToChannelJob implements ShouldQueue
                 return;
             }
 
-            $count = $validImages->count();
-            
             Log::info("SendElonToChannelJob: Processing images", [
                 'elon_id' => $this->elonId,
-                'total_images' => $images->count(),
-                'valid_images' => $count,
+                'images_count' => $imageCount,
             ]);
+
+            // Caption'ni tayyorlash
+            $finalCaption = !empty($caption) ? $caption : '';
             
-            if ($count === 1) {
+            // Telegram caption limit: 1024 belgi
+            if (mb_strlen($finalCaption) > 1024) {
+                $finalCaption = mb_substr($finalCaption, 0, 1020) . '...';
+            }
+
+            // Barcha rasmlar file_id bilan bo'lsa, SDK orqali yuborish
+            $allHaveFileId = $images->every(function ($image) {
+                return !empty($image->file_id);
+            });
+
+            if ($allHaveFileId && $imageCount > 1) {
+                // SDK orqali media group yuborish (file_id bilan)
+                $media = [];
+                foreach ($images->take(10) as $index => $image) {
+                    $media[] = [
+                        'type' => 'photo',
+                        'media' => $image->file_id,
+                    ];
+                }
+                
+                if (!empty($media)) {
+                    $media[0]['caption'] = $finalCaption;
+                    $media[0]['parse_mode'] = 'HTML';
+                    
+                    $telegram->sendMediaGroup([
+                        'chat_id' => $channelId,
+                        'media' => json_encode($media),
+                    ]);
+                    
+                    Log::info("SendElonToChannelJob: Images sent via SDK with file_id", [
+                        'elon_id' => $this->elonId,
+                        'count' => count($media),
+                    ]);
+                    return;
+                }
+            }
+            
+            if ($imageCount === 1) {
                 // 1 ta rasm bo'lsa → sendPhoto
-                $image = $validImages->first();
+                $image = $images->first();
                 $photo = $this->getPhotoInput($image, $botToken);
                 
                 if (!$photo) {
-                    Log::error("SendElonToChannelJob: Local file not found for image", [
+                    Log::error("SendElonToChannelJob: Image not found", [
                         'image_id' => $image->id,
+                        'file_id' => $image->file_id ?? null,
+                        's3_path' => $image->s3_path ?? null,
+                        's3_url' => $image->s3_url ?? null,
                         'local_path' => $image->local_path ?? null,
                     ]);
                     $telegram->sendMessage([
@@ -218,33 +256,12 @@ class SendElonToChannelJob implements ShouldQueue
                 $telegram->sendPhoto([
                     'chat_id' => $channelId,
                     'photo' => $photo,
-                    'caption' => $caption,
+                    'caption' => $finalCaption,
                     'parse_mode' => 'HTML',
                 ]);
             } else {
-                // 2-10 ta rasm bo'lsa → ularni birlashtirib bitta rasm yaratamiz va yuboramiz
-                $collagePath = $this->createImageCollage($validImages->take(10));
-                
-                if ($collagePath) {
-                    // Birlashtirilgan rasmni caption bilan yuboramiz
-                    $photo = InputFile::create($collagePath);
-                    $telegram->sendPhoto([
-                        'chat_id' => $channelId,
-                        'photo' => $photo,
-                        'caption' => $caption,
-                        'parse_mode' => 'HTML',
-                    ]);
-                    
-                    // Vaqtinchalik faylni o'chirish
-                    @unlink($collagePath);
-                } else {
-                    // Agar birlashtirishda xatolik bo'lsa, faqat text yuboramiz
-                    $telegram->sendMessage([
-                        'chat_id' => $channelId,
-                        'text' => $caption,
-                        'parse_mode' => 'HTML',
-                    ]);
-                }
+                // 2-10 ta rasm bo'lsa → Media Group qilib yuborish
+                $this->sendMediaGroupToChannel($botToken, $channelId, $images->take(10), $finalCaption);
             }
         } catch (\Exception $e) {
             Log::error("SendElonToChannelJob: Error sending images", [
@@ -258,64 +275,100 @@ class SendElonToChannelJob implements ShouldQueue
     }
 
     /**
-     * Rasm uchun input olish - faqat local fayldan
-     * 
-     * Faqat o'zimizda saqlangan fayllardan foydalanamiz
+     * Rasm uchun input olish - file_id, S3 yoki local fayldan
+     * Adminga yuborish bilan bir xil tartib
      * 
      * @return InputFile|string|null
      */
     private function getPhotoInput($image, string $botToken)
     {
-        // Faqat local_path'ni tekshiramiz
-        if (empty($image->local_path)) {
-            Log::error("SendElonToChannelJob: Image has no local_path", [
+        // Avval file_id'ni ishlatish (eng tez)
+        if (!empty($image->file_id)) {
+            Log::info("SendElonToChannelJob: Using file_id", [
                 'image_id' => $image->id,
+                'file_id' => $image->file_id,
             ]);
-            return null;
+            return $image->file_id;
         }
 
-        $fullPath = Storage::disk('public')->path($image->local_path);
-        
-        if (!file_exists($fullPath)) {
-            Log::error("SendElonToChannelJob: Local file not found", [
+        // Keyin S3 URL'ni tekshiramiz
+        if (!empty($image->s3_url)) {
+            Log::info("SendElonToChannelJob: Using S3 URL", [
                 'image_id' => $image->id,
-                'local_path' => $image->local_path,
-                'full_path' => $fullPath,
+                's3_url' => $image->s3_url,
             ]);
-            return null;
+            return $image->s3_url;
         }
 
-        // InputFile yordamida local faylni yuboramiz
-        Log::info("SendElonToChannelJob: Creating InputFile from local path", [
+        // Keyin S3 path'ni tekshiramiz
+        if (!empty($image->s3_path) && Storage::disk('s3')->exists($image->s3_path)) {
+            try {
+                // S3'dan faylni yuklab olish
+                $fileContent = Storage::disk('s3')->get($image->s3_path);
+                $tempFile = tmpfile();
+                $tempPath = stream_get_meta_data($tempFile)['uri'];
+                file_put_contents($tempPath, $fileContent);
+                
+                Log::info("SendElonToChannelJob: Using S3 path (downloaded to temp)", [
+                    'image_id' => $image->id,
+                    's3_path' => $image->s3_path,
+                ]);
+                
+                return $tempPath;
+            } catch (\Exception $e) {
+                Log::error("SendElonToChannelJob: Failed to get file from S3", [
+                    'image_id' => $image->id,
+                    's3_path' => $image->s3_path,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        // Keyin image_url (Telegram URL)
+        if (!empty($image->image_url)) {
+            Log::info("SendElonToChannelJob: Using image_url", [
+                'image_id' => $image->id,
+                'image_url' => $image->image_url,
+            ]);
+            return $image->image_url;
+        }
+
+        // Oxirgi variant - local_path
+        if (!empty($image->local_path)) {
+            $fullPath = Storage::disk('public')->path($image->local_path);
+            
+            if (file_exists($fullPath)) {
+                Log::info("SendElonToChannelJob: Using local path", [
+                    'image_id' => $image->id,
+                    'local_path' => $image->local_path,
+                ]);
+                
+                try {
+                    return InputFile::create($fullPath);
+                } catch (\Exception $e) {
+                    Log::warning("SendElonToChannelJob: InputFile::create failed, using direct path", [
+                        'image_id' => $image->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                    return $fullPath;
+                }
+            }
+        }
+
+        Log::error("SendElonToChannelJob: No valid image source found", [
             'image_id' => $image->id,
-            'local_path' => $image->local_path,
-            'full_path' => $fullPath,
         ]);
-        
-        try {
-            $inputFile = InputFile::create($fullPath);
-            Log::info("SendElonToChannelJob: InputFile created successfully", [
-                'image_id' => $image->id,
-            ]);
-            return $inputFile;
-        } catch (\Exception $e) {
-            Log::warning("SendElonToChannelJob: InputFile::create failed, using direct path", [
-                'image_id' => $image->id,
-                'error' => $e->getMessage(),
-            ]);
-            // To'g'ridan-to'g'ri path yuboramiz
-            return $fullPath;
-        }
+        return null;
     }
 
+
     /**
-     * sendMediaGroup ni to'g'ridan-to'g'ri Telegram API'ga yuborish (SDK'siz)
-     * 
-     * Bu metod SDK'dan foydalanmasdan, to'g'ridan-to'g'ri HTTP request yuboradi
+     * Media Group'ni kanalga yuborish
      */
-    private function sendMediaGroupDirect(string $botToken, string $channelId, $images, string $caption): void
+    private function sendMediaGroupToChannel(string $botToken, string $channelId, $images, string $caption): void
     {
         $fileHandles = [];
+        $tempFiles = [];
         
         try {
             $apiUrl = "https://api.telegram.org/bot{$botToken}/sendMediaGroup";
@@ -326,50 +379,170 @@ class SendElonToChannelJob implements ShouldQueue
                 ['name' => 'chat_id', 'contents' => $channelId],
             ];
             
+            Log::info("SendElonToChannelJob: Starting media group preparation", [
+                'elon_id' => $this->elonId,
+                'images_count' => $images->count(),
+            ]);
+            
             foreach ($images as $index => $image) {
-                if (empty($image->local_path)) {
-                    continue;
+                if ($index >= 10) { // Telegram maksimum 10 ta rasm qabul qiladi
+                    break;
                 }
                 
-                $fullPath = Storage::disk('public')->path($image->local_path);
+                Log::info("SendElonToChannelJob: Processing image for media group", [
+                    'elon_id' => $this->elonId,
+                    'image_id' => $image->id,
+                    'index' => $index,
+                    's3_path' => $image->s3_path ?? null,
+                    's3_url' => $image->s3_url ?? null,
+                    'local_path' => $image->local_path ?? null,
+                ]);
                 
-                if (!file_exists($fullPath)) {
-                    Log::warning("SendElonToChannelJob: File not found for media group", [
+                $mediaValue = null;
+                $useAttachment = false;
+                
+                // Avval file_id'ni ishlatish (eng tez)
+                if ($image->file_id) {
+                    $mediaValue = $image->file_id;
+                    Log::info("SendElonToChannelJob: Using file_id for media group", [
                         'image_id' => $image->id,
-                        'path' => $fullPath,
+                        'file_id' => $image->file_id,
+                    ]);
+                } elseif ($image->s3_url) {
+                    // S3 URL'ni ishlatish
+                    $mediaValue = $image->s3_url;
+                    Log::info("SendElonToChannelJob: Using S3 URL for media group", [
+                        'image_id' => $image->id,
+                        's3_url' => $image->s3_url,
+                    ]);
+                } elseif ($image->s3_path && Storage::disk('s3')->exists($image->s3_path)) {
+                    // S3'dan faylni yuklab olish va yuborish
+                    try {
+                        $fileContent = Storage::disk('s3')->get($image->s3_path);
+                        $tempFile = tmpfile();
+                        $tempPath = stream_get_meta_data($tempFile)['uri'];
+                        file_put_contents($tempPath, $fileContent);
+                        $tempFiles[] = $tempPath;
+                        
+                        $mediaValue = "attach://photo_{$index}";
+                        $useAttachment = true;
+                        
+                        // Faylni ochish
+                        $fileHandle = fopen($tempPath, 'r');
+                        if ($fileHandle !== false) {
+                            $fileHandles[] = $fileHandle;
+                            
+                            // Multipart uchun fayl qo'shamiz
+                            $multipart[] = [
+                                'name' => "photo_{$index}",
+                                'contents' => $fileHandle,
+                                'filename' => basename($image->s3_path),
+                            ];
+                            
+                            Log::info("SendElonToChannelJob: Image loaded from S3 path", [
+                                'image_id' => $image->id,
+                                's3_path' => $image->s3_path,
+                                'temp_path' => $tempPath,
+                            ]);
+                        } else {
+                            Log::warning("SendElonToChannelJob: Failed to open temp file", [
+                                'image_id' => $image->id,
+                                's3_path' => $image->s3_path,
+                            ]);
+                            continue;
+                        }
+                    } catch (\Exception $e) {
+                        Log::error("SendElonToChannelJob: Error getting file from S3", [
+                            'image_id' => $image->id,
+                            's3_path' => $image->s3_path,
+                            'error' => $e->getMessage(),
+                        ]);
+                        continue;
+                    }
+                } elseif ($image->image_url) {
+                    // Telegram URL'ni ishlatish
+                    $mediaValue = $image->image_url;
+                    Log::info("SendElonToChannelJob: Using image_url for media group", [
+                        'image_id' => $image->id,
+                        'image_url' => $image->image_url,
+                    ]);
+                } elseif ($image->local_path) {
+                    // Oxirgi variant - local_path
+                    $fullPath = Storage::disk('public')->path($image->local_path);
+                    
+                    if (file_exists($fullPath)) {
+                        $mediaValue = "attach://photo_{$index}";
+                        $useAttachment = true;
+                        
+                        $fileHandle = fopen($fullPath, 'r');
+                        if ($fileHandle === false) {
+                            Log::error("SendElonToChannelJob: Failed to open file", [
+                                'image_id' => $image->id,
+                                'path' => $fullPath,
+                            ]);
+                            continue;
+                        }
+                        
+                        $fileHandles[] = $fileHandle;
+                        $multipart[] = [
+                            'name' => "photo_{$index}",
+                            'contents' => $fileHandle,
+                            'filename' => basename($fullPath),
+                        ];
+                        
+                        Log::info("SendElonToChannelJob: Using local path for media group", [
+                            'image_id' => $image->id,
+                            'local_path' => $image->local_path,
+                        ]);
+                    } else {
+                        Log::warning("SendElonToChannelJob: File not found", [
+                            'image_id' => $image->id,
+                            'path' => $fullPath,
+                        ]);
+                    }
+                }
+                
+                // Agar hali ham mediaValue null bo'lsa, rasmni o'tkazib yuboramiz
+                if (!$mediaValue) {
+                    Log::warning("SendElonToChannelJob: No valid image source", [
+                        'image_id' => $image->id,
+                        's3_path' => $image->s3_path ?? null,
+                        's3_url' => $image->s3_url ?? null,
+                        'local_path' => $image->local_path ?? null,
                     ]);
                     continue;
                 }
                 
-                // Media item uchun JSON (caption'siz - barcha rasmlar bir guruh bo'lishi uchun)
-                $mediaItem = [
-                    'type' => 'photo',
-                    'media' => "attach://photo_{$index}",
-                ];
-                
-                // Caption qo'shmaymiz - barcha rasmlar bir guruh bo'lishi uchun
-                // Keyin alohida elon matnini yuboramiz
-                
-                $media[] = $mediaItem;
-                
-                // Faylni ochish va handle'ni saqlash
-                $fileHandle = fopen($fullPath, 'r');
-                if ($fileHandle === false) {
-                    Log::error("SendElonToChannelJob: Failed to open file", [
+                // Media item uchun JSON
+                if ($mediaValue) {
+                    $mediaItem = [
+                        'type' => 'photo',
+                        'media' => $mediaValue,
+                    ];
+                    
+                    // Birinchi rasmga caption qo'shamiz
+                    if ($index === 0 && !empty($caption)) {
+                        // Telegram caption limit: 1024 belgi
+                        $finalCaption = mb_strlen($caption) > 1024 ? mb_substr($caption, 0, 1020) . '...' : $caption;
+                        $mediaItem['caption'] = $finalCaption;
+                        $mediaItem['parse_mode'] = 'HTML';
+                    }
+                    
+                    $media[] = $mediaItem;
+                    
+                    Log::info("SendElonToChannelJob: Image added to media group", [
+                        'elon_id' => $this->elonId,
                         'image_id' => $image->id,
-                        'path' => $fullPath,
+                        'index' => $index,
+                        'media_value' => $mediaValue,
                     ]);
-                    continue;
+                } else {
+                    Log::warning("SendElonToChannelJob: Media value is null, skipping image", [
+                        'elon_id' => $this->elonId,
+                        'image_id' => $image->id,
+                        'index' => $index,
+                    ]);
                 }
-                
-                $fileHandles[] = $fileHandle;
-                
-                // Multipart uchun fayl qo'shamiz
-                $multipart[] = [
-                    'name' => "photo_{$index}",
-                    'contents' => $fileHandle,
-                    'filename' => basename($fullPath),
-                ];
             }
             
             if (empty($media)) {
@@ -385,9 +558,10 @@ class SendElonToChannelJob implements ShouldQueue
                 'contents' => json_encode($media),
             ];
             
-            Log::info("SendElonToChannelJob: Sending media group directly to Telegram API", [
+            Log::info("SendElonToChannelJob: Sending media group to channel", [
                 'elon_id' => $this->elonId,
                 'media_count' => count($media),
+                'valid_images' => count($media),
             ]);
             
             // HTTP request yuborish
@@ -397,11 +571,8 @@ class SendElonToChannelJob implements ShouldQueue
                 Log::info("SendElonToChannelJob: Media group sent successfully", [
                     'elon_id' => $this->elonId,
                     'count' => count($media),
+                    'response' => $response->json(),
                 ]);
-                
-                // Media group yuborilgandan keyin, elon matnini alohida yuboramiz
-                // Bu Telegram'da rasmlar tagida ko'rinadi
-                $this->sendCaptionAfterMediaGroup($botToken, $channelId, $caption);
             } else {
                 Log::error("SendElonToChannelJob: Failed to send media group", [
                     'elon_id' => $this->elonId,
@@ -411,7 +582,7 @@ class SendElonToChannelJob implements ShouldQueue
                 throw new \Exception("Failed to send media group: " . $response->body());
             }
         } catch (\Exception $e) {
-            Log::error("SendElonToChannelJob: Error sending media group directly", [
+            Log::error("SendElonToChannelJob: Error sending media group", [
                 'elon_id' => $this->elonId,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
@@ -424,126 +595,113 @@ class SendElonToChannelJob implements ShouldQueue
                     fclose($handle);
                 }
             }
+            // Vaqtinchalik fayllarni o'chirish
+            foreach ($tempFiles as $tempPath) {
+                if (file_exists($tempPath)) {
+                    @unlink($tempPath);
+                }
+            }
         }
     }
 
     /**
      * Bir nechta rasmlarni birlashtirib bitta rasm (collage) yaratish
+     * Intervention Image v3 bilan
      * 
      * @param $images
      * @return string|null Birlashtirilgan rasmning to'liq path'i yoki null
      */
     private function createImageCollage($images): ?string
     {
-        if (!function_exists('imagecreatetruecolor')) {
-            Log::error("SendElonToChannelJob: GD library not available");
-            return null;
-        }
-
         try {
             $imageCount = $images->count();
-            if ($imageCount === 0) {
+            if ($imageCount === 0 || $imageCount > 4) {
                 return null;
             }
 
-            // Grid o'lchamlari (2x2, 2x3, 3x3, va hokazo)
-            $cols = $imageCount <= 4 ? 2 : 3;
-            $rows = ceil($imageCount / $cols);
+            // Intervention Image Manager yaratish
+            $manager = new ImageManager(new Driver());
+
+            // Grid layout aniqlash
+            $layout = $this->getGridLayout($imageCount);
+            $cols = $layout['cols'];
+            $rows = $layout['rows'];
             
-            // Har bir rasm uchun o'lcham (max 1000px width, 1000px height)
-            $thumbWidth = 1000 / $cols;
-            $thumbHeight = 1000 / $rows;
+            // Har bir rasm uchun o'lcham (1000px width, 1000px height maksimum)
+            $cellWidth = 1000 / $cols;
+            $cellHeight = 1000 / $rows;
             
-            // Umumiy canvas o'lchami
-            $canvasWidth = $thumbWidth * $cols;
-            $canvasHeight = $thumbHeight * $rows;
+            // Canvas o'lchami
+            $canvasWidth = (int)($cellWidth * $cols);
+            $canvasHeight = (int)($cellHeight * $rows);
             
-            // Canvas yaratish
-            $canvas = imagecreatetruecolor($canvasWidth, $canvasHeight);
-            $white = imagecolorallocate($canvas, 255, 255, 255);
-            imagefill($canvas, 0, 0, $white);
+            // Canvas yaratish (oq fon)
+            $canvas = $manager->create($canvasWidth, $canvasHeight);
             
             $index = 0;
+            $loadedImages = [];
+            
             foreach ($images as $image) {
-                if (empty($image->local_path)) {
+                try {
+                    // Rasmni yuklash (S3 yoki local)
+                    $sourceImage = $this->loadImageForCollage($image);
+                    if (!$sourceImage) {
+                        Log::warning("SendElonToChannelJob: Failed to load image", [
+                            'image_id' => $image->id ?? null,
+                        ]);
+                        continue;
+                    }
+                    
+                    // Rasmni kichraytirish (aspect ratio saqlab, cover qilib)
+                    $resized = $sourceImage->cover($cellWidth, $cellHeight);
+                    $loadedImages[] = [
+                        'image' => $resized,
+                        'index' => $index,
+                    ];
+                    
+                    $index++;
+                } catch (\Exception $e) {
+                    Log::warning("SendElonToChannelJob: Error processing image for collage", [
+                        'image_id' => $image->id ?? null,
+                        'error' => $e->getMessage(),
+                        'trace' => $e->getTraceAsString(),
+                    ]);
                     continue;
                 }
-                
-                $fullPath = Storage::disk('public')->path($image->local_path);
-                
-                if (!file_exists($fullPath)) {
-                    continue;
-                }
-                
-                // Rasmni yuklash
-                $sourceImage = $this->loadImage($fullPath);
-                if (!$sourceImage) {
-                    continue;
-                }
-                
-                // Source o'lchamlari
-                $sourceWidth = imagesx($sourceImage);
-                $sourceHeight = imagesy($sourceImage);
-                
-                // Aspect ratio'ni saqlab qolish - rasmlarni qirqmasdan to'liq ko'rsatish
-                $sourceAspect = $sourceWidth / $sourceHeight;
-                $thumbAspect = $thumbWidth / $thumbHeight;
-                
-                // Rasmni qirqmasdan, to'liq ko'rsatish uchun o'lchamlarni hisoblash
-                if ($sourceAspect > $thumbAspect) {
-                    // Rasm kengroq - balandlikni to'liq ishlatamiz
-                    $newHeight = $thumbHeight;
-                    $newWidth = (int)($thumbHeight * $sourceAspect);
-                } else {
-                    // Rasm balandroq - kenglikni to'liq ishlatamiz
-                    $newWidth = $thumbWidth;
-                    $newHeight = (int)($thumbWidth / $sourceAspect);
-                }
-                
-                // Thumbnail yaratish (oq fon bilan)
-                $thumb = imagecreatetruecolor($thumbWidth, $thumbHeight);
-                $white = imagecolorallocate($thumb, 255, 255, 255);
-                imagefill($thumb, 0, 0, $white);
-                
-                // Markazga joylashtirish (rasm qirqilmaydi, faqat markazga joylashtiriladi)
-                $x = (int)(($thumbWidth - $newWidth) / 2);
-                $y = (int)(($thumbHeight - $newHeight) / 2);
-                
-                // Rasmni resize qilish va markazga joylashtirish (qirqmasdan)
-                imagecopyresampled(
-                    $thumb,
-                    $sourceImage,
-                    $x, $y, 0, 0,
-                    $newWidth, $newHeight,  // Yangi o'lcham (qirqilmaydi)
-                    $sourceWidth, $sourceHeight  // Original o'lcham
-                );
-                
-                // Canvas'ga joylashtirish
-                $col = $index % $cols;
-                $row = (int)($index / $cols);
-                $xPos = $col * $thumbWidth;
-                $yPos = $row * $thumbHeight;
-                
-                imagecopy($canvas, $thumb, $xPos, $yPos, 0, 0, $thumbWidth, $thumbHeight);
-                
-                // Memory tozalash
-                imagedestroy($sourceImage);
-                imagedestroy($thumb);
-                
-                $index++;
             }
             
-            // Birlashtirilgan rasmni saqlash
-            $outputPath = storage_path('app/public/temp/collage_' . $this->elonId . '_' . time() . '.jpg');
+            // Agar hech qanday rasm yuklanmagan bo'lsa
+            if (empty($loadedImages)) {
+                Log::error("SendElonToChannelJob: No images loaded for collage", [
+                    'elon_id' => $this->elonId,
+                ]);
+                return null;
+            }
+            
+            // Rasmlarni canvas'ga joylashtirish
+            foreach ($loadedImages as $item) {
+                $resized = $item['image'];
+                $imgIndex = $item['index'];
+                
+                // Grid pozitsiyasi
+                $col = $imgIndex % $cols;
+                $row = (int)($imgIndex / $cols);
+                $xPos = (int)($col * $cellWidth);
+                $yPos = (int)($row * $cellHeight);
+                
+                // Canvas'ga joylashtirish
+                $canvas->place($resized, 'top-left', $xPos, $yPos);
+            }
             
             // Temp papkani yaratish
-            $tempDir = dirname($outputPath);
+            $tempDir = storage_path('app/public/temp');
             if (!is_dir($tempDir)) {
                 mkdir($tempDir, 0755, true);
             }
             
-            imagejpeg($canvas, $outputPath, 85);
-            imagedestroy($canvas);
+            // Birlashtirilgan rasmni saqlash
+            $outputPath = $tempDir . '/collage_' . $this->elonId . '_' . time() . '.jpg';
+            $canvas->toJpeg(85)->save($outputPath);
             
             Log::info("SendElonToChannelJob: Image collage created", [
                 'elon_id' => $this->elonId,
@@ -563,70 +721,77 @@ class SendElonToChannelJob implements ShouldQueue
     }
 
     /**
-     * Rasmni yuklash (turli formatlarni qo'llab-quvvatlaydi)
+     * Grid layout aniqlash
      */
-    private function loadImage(string $path)
+    private function getGridLayout(int $count): array
     {
-        if (!file_exists($path)) {
-            return false;
-        }
-        
-        $imageInfo = getimagesize($path);
-        if (!$imageInfo) {
-            return false;
-        }
-        
-        $mimeType = $imageInfo['mime'];
-        
-        switch ($mimeType) {
-            case 'image/jpeg':
-            case 'image/jpg':
-                return imagecreatefromjpeg($path);
-            case 'image/png':
-                return imagecreatefrompng($path);
-            case 'image/gif':
-                return imagecreatefromgif($path);
-            case 'image/webp':
-                if (function_exists('imagecreatefromwebp')) {
-                    return imagecreatefromwebp($path);
-                }
-                break;
-        }
-        
-        return false;
+        return match($count) {
+            1 => ['cols' => 1, 'rows' => 1],
+            2 => ['cols' => 1, 'rows' => 2],
+            3 => ['cols' => 2, 'rows' => 2],
+            4 => ['cols' => 2, 'rows' => 2],
+            default => ['cols' => 2, 'rows' => 2],
+        };
     }
 
     /**
-     * Media group yuborilgandan keyin elon matnini yuborish
+     * Collage uchun rasmni yuklash (S3 yoki local)
      */
-    private function sendCaptionAfterMediaGroup(string $botToken, string $channelId, string $caption): void
+    private function loadImageForCollage($image)
     {
-        try {
-            $apiUrl = "https://api.telegram.org/bot{$botToken}/sendMessage";
-            
-            $response = Http::post($apiUrl, [
-                'chat_id' => $channelId,
-                'text' => $caption,
-                'parse_mode' => 'HTML',
-            ]);
-            
-            if ($response->successful()) {
-                Log::info("SendElonToChannelJob: Caption sent after media group", [
-                    'elon_id' => $this->elonId,
-                ]);
-            } else {
-                Log::error("SendElonToChannelJob: Failed to send caption after media group", [
-                    'elon_id' => $this->elonId,
-                    'status' => $response->status(),
-                    'response' => $response->body(),
+        $manager = new ImageManager(new Driver());
+        
+        // Avval S3 path'ni tekshiramiz (eng ishonchli)
+        if (!empty($image->s3_path)) {
+            try {
+                if (Storage::disk('s3')->exists($image->s3_path)) {
+                    $fileContent = Storage::disk('s3')->get($image->s3_path);
+                    return $manager->read($fileContent);
+                }
+            } catch (\Exception $e) {
+                Log::warning("SendElonToChannelJob: Failed to load image from S3 path", [
+                    'image_id' => $image->id,
+                    's3_path' => $image->s3_path,
+                    'error' => $e->getMessage(),
                 ]);
             }
-        } catch (\Exception $e) {
-            Log::error("SendElonToChannelJob: Error sending caption after media group", [
-                'elon_id' => $this->elonId,
-                'error' => $e->getMessage(),
-            ]);
-            // Caption yuborishda xatolik bo'lsa ham, media group yuborilgan bo'ladi
         }
+        
+        // Keyin S3 URL'ni HTTP orqali yuklab olish
+        if (!empty($image->s3_url)) {
+            try {
+                $response = Http::timeout(30)->get($image->s3_url);
+                if ($response->successful()) {
+                    $fileContent = $response->body();
+                    return $manager->read($fileContent);
+                }
+            } catch (\Exception $e) {
+                Log::warning("SendElonToChannelJob: Failed to load image from S3 URL", [
+                    'image_id' => $image->id,
+                    's3_url' => $image->s3_url,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+        
+        // Oxirgi variant - local_path
+        if (!empty($image->local_path)) {
+            $fullPath = Storage::disk('public')->path($image->local_path);
+            if (file_exists($fullPath)) {
+                try {
+                    return $manager->read($fullPath);
+                } catch (\Exception $e) {
+                    Log::warning("SendElonToChannelJob: Failed to load image from local path", [
+                        'image_id' => $image->id,
+                        'local_path' => $image->local_path,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+        }
+        
+        return null;
     }
+
+
 }
