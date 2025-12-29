@@ -343,6 +343,8 @@ class ElonService
             'local_path' => $localPath,
         ]);
 
+        // Elon'ni refresh qilish (yangi saqlangan rasmni hisobga olish uchun)
+        $elon->refresh();
         $imageCount = $elon->images()->count();
         
         if ($imageCount >= 4) {
@@ -1113,11 +1115,22 @@ class ElonService
     private function downloadAndSaveImage(string $fileUrl, string $filePath, int $elonId): ?string
     {
         try {
-            // Rasmni yuklab olish
-            $imageContent = file_get_contents($fileUrl);
+            // Rasmni HTTP client orqali yuklab olish (timeout bilan)
+            $response = Http::timeout(30)->get($fileUrl);
             
-            if ($imageContent === false) {
+            if (!$response->successful()) {
                 Log::error("Failed to download image from Telegram", [
+                    'file_url' => $fileUrl,
+                    'file_path' => $filePath,
+                    'status' => $response->status(),
+                ]);
+                return null;
+            }
+            
+            $imageContent = $response->body();
+            
+            if (empty($imageContent)) {
+                Log::error("Empty image content downloaded", [
                     'file_url' => $fileUrl,
                     'file_path' => $filePath,
                 ]);
