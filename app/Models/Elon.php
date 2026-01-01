@@ -40,6 +40,9 @@ class Elon extends Model
         'status',
         'cancelled_from_admin',
         'cancelled_from_user',
+        'is_sold',
+        'sold_feedback',
+        'elon_message_id',
     ];
 
     /**
@@ -54,6 +57,7 @@ class Elon extends Model
         'narxi' => 'decimal:2',
         'cancelled_from_admin' => 'boolean',
         'cancelled_from_user' => 'boolean',
+        'is_sold' => 'boolean',
     ];
 
     /**

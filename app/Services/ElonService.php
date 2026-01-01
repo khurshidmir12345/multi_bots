@@ -297,6 +297,48 @@ class ElonService
                     $this->askConfirm($message->chat->id, $elon);
                 }
                 break;
+
+            case 'sold_feedback':
+                // Faol elon topish (sotilgan elon)
+                $soldElon = $user->elonlar()
+                    ->where('is_sold', true)
+                    ->latest()
+                    ->first();
+
+                if ($soldElon) {
+                    $soldElon->sold_feedback = $text;
+                    $soldElon->save();
+                    $user->current_step = null;
+                    $user->save();
+
+                    // Agar elon kanalga chiqgan bo'lsa (elon_message_id bor bo'lsa), feedback qo'shish uchun job'ni navbatga qo'yish
+                    // Elon'ni refresh qilish (boshqa job tomonidan o'zgartirilgan bo'lishi mumkin)
+                    $soldElon->refresh();
+                    
+                    if ($soldElon->elon_message_id) {
+                        try {
+                            // Kichik kechikish - birinchi job (hashtag) tugallanishini kutish
+                            \App\Jobs\UpdateSoldElonFeedbackJob::dispatch($soldElon->id, $this->bot->id)
+                                ->delay(now()->addSeconds(2));
+                            
+                            Log::info("UpdateSoldElonFeedbackJob queued after feedback", [
+                                'elon_id' => $soldElon->id,
+                                'bot_id' => $this->bot->id,
+                            ]);
+                        } catch (\Exception $e) {
+                            Log::error("Error queueing UpdateSoldElonFeedbackJob after feedback", [
+                                'elon_id' => $soldElon->id,
+                                'bot_id' => $this->bot->id,
+                                'error' => $e->getMessage(),
+                            ]);
+                        }
+                    }
+
+                    $this->sendMessage($message->chat->id, "✅ Fikringiz qabul qilindi va saqlandi!\n\nRahmat! 🙏");
+                } else {
+                    $this->sendMessage($message->chat->id, "❌ Xatolik yuz berdi!");
+                }
+                break;
         }
     }
 
@@ -515,7 +557,34 @@ class ElonService
         $text .= "Elon admin tomonidan ko'rib chiqilgandan keyin kanalga joylashtiriladi.\n\n";
         $text .= "Yangi elon yaratish uchun /start buyrug'ini yuboring.";
 
-        $this->sendMessage($chatId, $text);
+        // "Bekor qilish" button bilan xabar yuborish
+        try {
+            $keyboard = [
+                'inline_keyboard' => [
+                    [
+                        [
+                            'text' => '❌ Bekor qilish',
+                            'callback_data' => "elon_cancel_user_{$elon->id}"
+                        ]
+                    ]
+                ]
+            ];
+
+            $this->telegram->sendMessage([
+                'chat_id' => $chatId,
+                'text' => $text,
+                'parse_mode' => 'Markdown',
+                'reply_markup' => json_encode($keyboard),
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error sending confirmation with cancel button", [
+                'chat_id' => $chatId,
+                'elon_id' => $elon->id,
+                'error' => $e->getMessage(),
+            ]);
+            // Xatolik bo'lsa, button'siz yuborish
+            $this->sendMessage($chatId, $text);
+        }
     }
 
     /**
@@ -969,6 +1038,10 @@ class ElonService
             // Foydalanuvchi callback'i - admin tekshiruvi yo'q
             $elonId = (int) str_replace('elon_confirm_no_', '', $data);
             $this->handleConfirmNo($chatId, $elonId, $callbackQuery->id, $messageId);
+        } elseif (str_starts_with($data, 'elon_sold_')) {
+            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+            $elonId = (int) str_replace('elon_sold_', '', $data);
+            $this->handleUserSold($chatId, $elonId, $callbackQuery->id, $messageId);
         }
     }
 
@@ -994,6 +1067,32 @@ class ElonService
                 'callback_query_id' => $callbackQueryId,
                 'text' => 'Bu elon allaqachon tasdiqlangan!',
                 'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Agar foydalanuvchi tomonidan bekor qilingan bo'lsa, kanalga yuborilmaydi
+        if ($elon->cancelled_from_user) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Bu elon foydalanuvchi tomonidan bekor qilingan!',
+                'show_alert' => true,
+            ]);
+            
+            // Xabarni yangilash
+            $text = $this->formatElonForAdmin($elon);
+            $text .= "\n\n❌ *Foydalanuvchi tomonidan bekor qilingan*";
+            
+            $this->telegram->editMessageText([
+                'chat_id' => $adminChatId,
+                'message_id' => $messageId,
+                'text' => $text,
+                'parse_mode' => 'Markdown',
+            ]);
+            
+            Log::info("Elon not sent to channel - cancelled by user", [
+                'elon_id' => $elonId,
+                'admin_chat_id' => $adminChatId,
             ]);
             return;
         }
@@ -1041,7 +1140,7 @@ class ElonService
             $userText = "✅ *Elon tasdiqlandi!*\n\n";
             $userText .= "Elon ID: #{$elon->id}\n\n";
             $userText .= "Elon kanalga yuborildi.\n\n";
-            $userText .= "Agar elonni bekor qilmoqchi bo'lsangiz, quyidagi tugmani bosing.";
+            $userText .= "Agar elonni bekor qilmoqchi bo'lsangiz yoki moshina sotilgan bo'lsa, quyidagi tugmalardan birini bosing.";
             
             $keyboard = [
                 'inline_keyboard' => [
@@ -1049,6 +1148,10 @@ class ElonService
                         [
                             'text' => '❌ Elonni bekor qilish',
                             'callback_data' => "elon_cancel_user_{$elon->id}"
+                        ],
+                        [
+                            'text' => '✅ Moshina sotildi',
+                            'callback_data' => "elon_sold_{$elon->id}"
                         ]
                     ]
                 ]
@@ -1137,7 +1240,7 @@ class ElonService
         }
 
         // Foydalanuvchi ekanligini tekshirish
-        if ($elon->elonUser->chat_id !== $userChatId) {
+        if (!$elon->elonUser || $elon->elonUser->chat_id !== $userChatId) {
             $this->telegram->answerCallbackQuery([
                 'callback_query_id' => $callbackQueryId,
                 'text' => 'Bu sizning eloningiz emas!',
@@ -1190,6 +1293,101 @@ class ElonService
         ]);
 
         Log::info("Elon cancelled by user", [
+            'elon_id' => $elonId,
+            'user_chat_id' => $userChatId,
+        ]);
+    }
+
+    /**
+     * Foydalanuvchi tomonidan moshina sotildi deb belgilash
+     */
+    private function handleUserSold(int $userChatId, int $elonId, string $callbackQueryId, int $messageId): void
+    {
+        $elon = Elon::find($elonId);
+        
+        if (!$elon) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Elon topilmadi!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Foydalanuvchi ekanligini tekshirish
+        if (!$elon->elonUser || $elon->elonUser->chat_id !== $userChatId) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Bu sizning eloningiz emas!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Agar allaqachon sotilgan bo'lsa
+        if ($elon->is_sold) {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Moshina allaqachon sotilgan deb belgilangan!',
+                'show_alert' => true,
+            ]);
+            return;
+        }
+
+        // Elon is_sold'ni yangilash
+        $elon->is_sold = true;
+        $elon->save();
+
+        // User step'ni sold_feedback ga o'rnatish
+        $user = $elon->elonUser;
+        $user->current_step = 'sold_feedback';
+        $user->save();
+
+        // Callback query'ga javob
+        $this->telegram->answerCallbackQuery([
+            'callback_query_id' => $callbackQueryId,
+            'text' => 'Moshina sotildi deb belgilandi! ✅',
+        ]);
+
+        // Xabarni yangilash
+        $text = "✅ *Elon tasdiqlandi!*\n\n";
+        $text .= "Elon ID: #{$elon->id}\n\n";
+        $text .= "✅ *Moshina sotildi* (Siz tomoningizdan belgilandi)";
+
+        $this->telegram->editMessageText([
+            'chat_id' => $userChatId,
+            'message_id' => $messageId,
+            'text' => $text,
+            'parse_mode' => 'Markdown',
+        ]);
+
+        // User'ga xabar yuborish
+        $feedbackText = "🎉 *@Avto_vodiyuz kanali sizga xizmat ko'rsatganidan mamnun!*\n\n";
+        $feedbackText .= "Ishlarizga omad tilaymiz! 🍀\n\n";
+        $feedbackText .= "Kanalga joylash uchun izoh yozib bering. Qisqacha elonga fikringizni joylab qo'yamiz.";
+
+        $this->sendMessage($userChatId, $feedbackText);
+
+        // Agar elon kanalga chiqgan bo'lsa (elon_message_id bor bo'lsa), update job'ni navbatga qo'yish
+        // Faqat hashtag (#sotildi) qo'yish uchun
+        if ($elon->elon_message_id) {
+            try {
+                \App\Jobs\UpdateSoldElonJob::dispatch($elon->id, $this->bot->id);
+                
+                Log::info("UpdateSoldElonJob queued (for hashtag)", [
+                    'elon_id' => $elonId,
+                    'bot_id' => $this->bot->id,
+                ]);
+            } catch (\Exception $e) {
+                Log::error("Error queueing UpdateSoldElonJob", [
+                    'elon_id' => $elonId,
+                    'bot_id' => $this->bot->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        Log::info("Elon marked as sold by user, waiting for feedback", [
             'elon_id' => $elonId,
             'user_chat_id' => $userChatId,
         ]);

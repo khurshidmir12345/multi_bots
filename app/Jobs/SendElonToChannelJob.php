@@ -65,20 +65,26 @@ class SendElonToChannelJob implements ShouldQueue
             $images = $elon->images()->get();
             $caption = $this->formatElonForChannel($elon, $bot, $telegram);
 
+            $messageId = null;
+
             // Rasmlarni kanalga yuborish
             if ($images->isNotEmpty()) {
-                $this->sendImagesToChannel($telegram, $bot->channel_id, $images, $caption, $bot->token);
+                $messageId = $this->sendImagesToChannel($telegram, $bot->channel_id, $images, $caption, $bot->token);
             } else {
                 // Agar rasm bo'lmasa, faqat text
-                $telegram->sendMessage([
+                $response = $telegram->sendMessage([
                     'chat_id' => $bot->channel_id,
                     'text' => $caption,
                     'parse_mode' => 'HTML',
                 ]);
+                $messageId = $response->messageId ?? null;
             }
 
-            // Elon muvaffaqiyatli yuborilgandan keyin statusni yangilash
+            // Elon muvaffaqiyatli yuborilgandan keyin statusni va message_id ni yangilash
             $elon->status = Elon::STATUS_COMPLATED;
+            if ($messageId) {
+                $elon->elon_message_id = (string) $messageId;
+            }
             $elon->save();
 
             Log::info("SendElonToChannelJob: Elon sent to channel successfully", [
@@ -168,8 +174,9 @@ class SendElonToChannelJob implements ShouldQueue
 
     /**
      * Rasmlarni kanalga yuborish (Media Group yoki bitta rasm)
+     * @return int|null Birinchi xabarning message_id
      */
-    private function sendImagesToChannel(Api $telegram, string $channelId, $images, string $caption, string $botToken): void
+    private function sendImagesToChannel(Api $telegram, string $channelId, $images, string $caption, string $botToken): ?int
     {
         try {
             $imageCount = $images->count();
@@ -179,12 +186,12 @@ class SendElonToChannelJob implements ShouldQueue
                     'elon_id' => $this->elonId,
                 ]);
                 
-                $telegram->sendMessage([
+                $response = $telegram->sendMessage([
                     'chat_id' => $channelId,
                     'text' => $caption,
                     'parse_mode' => 'HTML',
                 ]);
-                return;
+                return $response->messageId ?? null;
             }
 
             Log::info("SendElonToChannelJob: Processing images", [
@@ -219,16 +226,24 @@ class SendElonToChannelJob implements ShouldQueue
                     $media[0]['caption'] = $finalCaption;
                     $media[0]['parse_mode'] = 'HTML';
                     
-                    $telegram->sendMediaGroup([
+                    $response = $telegram->sendMediaGroup([
                         'chat_id' => $channelId,
                         'media' => json_encode($media),
                     ]);
                     
+                    // Media group bo'lsa, birinchi xabarning message_id ni olish
+                    $messageId = null;
+                    if (is_array($response) && !empty($response)) {
+                        $firstMessage = $response[0] ?? null;
+                        $messageId = $firstMessage->messageId ?? null;
+                    }
+                    
                     Log::info("SendElonToChannelJob: Images sent via SDK with file_id", [
                         'elon_id' => $this->elonId,
                         'count' => count($media),
+                        'message_id' => $messageId,
                     ]);
-                    return;
+                    return $messageId;
                 }
             }
             
@@ -245,23 +260,24 @@ class SendElonToChannelJob implements ShouldQueue
                         's3_url' => $image->s3_url ?? null,
                         'local_path' => $image->local_path ?? null,
                     ]);
-                    $telegram->sendMessage([
+                    $response = $telegram->sendMessage([
                         'chat_id' => $channelId,
                         'text' => $caption,
                         'parse_mode' => 'HTML',
                     ]);
-                    return;
+                    return $response->messageId ?? null;
                 }
                 
-                $telegram->sendPhoto([
+                $response = $telegram->sendPhoto([
                     'chat_id' => $channelId,
                     'photo' => $photo,
                     'caption' => $finalCaption,
                     'parse_mode' => 'HTML',
                 ]);
+                return $response->messageId ?? null;
             } else {
                 // 2-10 ta rasm bo'lsa → Media Group qilib yuborish
-                $this->sendMediaGroupToChannel($botToken, $channelId, $images->take(10), $finalCaption);
+                return $this->sendMediaGroupToChannel($botToken, $channelId, $images->take(10), $finalCaption);
             }
         } catch (\Exception $e) {
             Log::error("SendElonToChannelJob: Error sending images", [
@@ -272,6 +288,8 @@ class SendElonToChannelJob implements ShouldQueue
             ]);
             throw $e;
         }
+        
+        return null;
     }
 
     /**
@@ -364,8 +382,9 @@ class SendElonToChannelJob implements ShouldQueue
 
     /**
      * Media Group'ni kanalga yuborish
+     * @return int|null Birinchi xabarning message_id
      */
-    private function sendMediaGroupToChannel(string $botToken, string $channelId, $images, string $caption): void
+    private function sendMediaGroupToChannel(string $botToken, string $channelId, $images, string $caption): ?int
     {
         $fileHandles = [];
         $tempFiles = [];
@@ -549,7 +568,7 @@ class SendElonToChannelJob implements ShouldQueue
                 Log::warning("SendElonToChannelJob: No valid media items for media group", [
                     'elon_id' => $this->elonId,
                 ]);
-                return;
+                return null;
             }
             
             // Media array'ni JSON string sifatida qo'shamiz
@@ -568,11 +587,21 @@ class SendElonToChannelJob implements ShouldQueue
             $response = Http::asMultipart()->post($apiUrl, $multipart);
             
             if ($response->successful()) {
+                $responseData = $response->json();
+                // Media group bo'lsa, birinchi xabarning message_id ni olish
+                $messageId = null;
+                if (isset($responseData['result']) && is_array($responseData['result']) && !empty($responseData['result'])) {
+                    $firstMessage = $responseData['result'][0] ?? null;
+                    $messageId = $firstMessage['message_id'] ?? null;
+                }
+                
                 Log::info("SendElonToChannelJob: Media group sent successfully", [
                     'elon_id' => $this->elonId,
                     'count' => count($media),
-                    'response' => $response->json(),
+                    'message_id' => $messageId,
                 ]);
+                
+                return $messageId;
             } else {
                 Log::error("SendElonToChannelJob: Failed to send media group", [
                     'elon_id' => $this->elonId,
