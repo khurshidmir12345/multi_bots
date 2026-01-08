@@ -84,23 +84,50 @@ class ViewElon extends ViewRecord
                         Infolists\Components\RepeatableEntry::make('images')
                             ->label('')
                             ->schema([
-                                Infolists\Components\ImageEntry::make('local_path')
+                                Infolists\Components\TextEntry::make('image_display')
                                     ->label('')
-                                    ->height(200)
-                                    ->width(200)
-                                    ->formatStateUsing(function ($state, $record) {
-                                        // Avval local_path'ni tekshirish
-                                        if ($state && Storage::disk('public')->exists($state)) {
-                                            return Storage::disk('public')->url($state);
+                                    ->html()
+                                    ->formatStateUsing(function ($record) {
+                                        $imageUrl = $record->display_url;
+                                        
+                                        if (!$imageUrl) {
+                                            // Barcha maydonlarni tekshirish
+                                            $debug = [];
+                                            if ($record->s3_url) $debug[] = 's3_url: ' . $record->s3_url;
+                                            if ($record->s3_path) $debug[] = 's3_path: ' . $record->s3_path;
+                                            if ($record->local_path) $debug[] = 'local_path: ' . $record->local_path;
+                                            if ($record->image_url) $debug[] = 'image_url: ' . $record->image_url;
+                                            
+                                            return '<p style="color: red;">Rasm topilmadi</p>' . 
+                                                   (!empty($debug) ? '<p style="font-size: 12px; color: gray;">' . implode('<br>', $debug) . '</p>' : '');
                                         }
-                                        // Keyin image_url'ni ishlatish
-                                        if ($record->image_url) {
-                                            return $record->image_url;
+                                        
+                                        // URL'ni tekshirish
+                                        $urlInfo = parse_url($imageUrl);
+                                        if (!$urlInfo || !isset($urlInfo['scheme'])) {
+                                            return '<p style="color: orange;">Noto\'g\'ri URL: ' . htmlspecialchars($imageUrl) . '</p>';
                                         }
-                                        return null;
+                                        
+                                        return sprintf(
+                                            '<div style="text-align: center;"><img src="%s" alt="Rasm" style="max-width: 100%%; max-height: 400px; object-fit: contain; border: 1px solid #ddd; border-radius: 8px; padding: 8px; background: #f9f9f9;" onerror="this.style.display=\'none\'; this.nextElementSibling.style.display=\'block\';" /><p style="display:none; color: red; padding: 10px;">Rasm yuklanmadi. URL: <a href=\'%s\' target=\'_blank\'>%s</a></p></div>',
+                                            htmlspecialchars($imageUrl, ENT_QUOTES, 'UTF-8'),
+                                            htmlspecialchars($imageUrl, ENT_QUOTES, 'UTF-8'),
+                                            htmlspecialchars($imageUrl, ENT_QUOTES, 'UTF-8')
+                                        );
                                     }),
+                                Infolists\Components\TextEntry::make('url_info')
+                                    ->label('URL (tekshirish uchun)')
+                                    ->formatStateUsing(function ($record) {
+                                        $url = $record->display_url;
+                                        if (!$url) {
+                                            return '<span style="color: red;">URL topilmadi</span>';
+                                        }
+                                        return '<a href="' . htmlspecialchars($url, ENT_QUOTES) . '" target="_blank" style="word-break: break-all; color: #3b82f6; text-decoration: underline;">' . htmlspecialchars($url) . '</a>';
+                                    })
+                                    ->html()
+                                    ->columnSpanFull(),
                             ])
-                            ->columns(3)
+                            ->columns(1)
                             ->grid(3),
                     ])
                     ->visible(fn ($record) => $record->images()->count() > 0),
