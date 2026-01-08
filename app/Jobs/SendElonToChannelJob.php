@@ -108,26 +108,48 @@ class SendElonToChannelJob implements ShouldQueue
      */
     private function formatElonForChannel(Elon $elon, Bot $bot, Api $telegram): string
     {
-        $text = "🚗 <b>Moshina:</b> " . htmlspecialchars($elon->modeli ?? '-') . "\n";
-        $text .= "🔧 <b>Karobka:</b> " . htmlspecialchars($elon->pozitsiyasi ?? '-') . "\n";
-        $text .= "🎨 <b>Rangi:</b> " . htmlspecialchars($elon->rangi ?? '-') . "\n";
-        $text .= "🖌️ <b>Kraskasi:</b> " . htmlspecialchars($elon->kraskasi ?? '-') . "\n";
-        $text .= "📆 <b>Yil:</b> " . ($elon->yili ?? '-') . "\n";
-        $text .= "📏 <b>Probeg:</b> " . ($elon->yurgani ? number_format($elon->yurgani, 0, '.', ' ') : '-') . "\n";
-        $text .= "⛽ <b>Yoqilg'i:</b> " . htmlspecialchars($elon->yoqilgisi ?? '-') . "\n";
+        // Model nomidan hashtag yaratish (lotin xarflar bilan)
+        $modelForHashtag = $elon->modeli ?? '';
+        $hashtag = '#' . preg_replace('/[^a-zA-Z0-9_]/', '_', mb_strtolower($modelForHashtag));
+        $hashtag = htmlspecialchars($hashtag);
+        
+        // Elon matnidan oldin sarlavha qo'shish (kirill xarflarda)
+        $text = "♻️♻️ " . $hashtag . " Сотилади ♻️♻️\n\n";
+        
+        // Label'larni kirill xarflarga almashtirish, mijoz ma'lumotlari o'zgarmasligi kerak
+        $text .= "🚗 <b>Модел:</b> " . htmlspecialchars($elon->modeli ?? '-') . "\n";
+        $text .= "🔧 <b>Позицияси:</b> " . htmlspecialchars($elon->pozitsiyasi ?? '-') . "\n";
+        $text .= "🎨 <b>Ранги:</b> " . htmlspecialchars($elon->rangi ?? '-') . "\n";
+        $text .= "🖌️ <b>Краскаси:</b> " . htmlspecialchars($elon->kraskasi ?? '-') . "\n";
+        
+        // Yil - kirill xarflarda "yil" qo'shish
+        $yilText = ($elon->yili ?? '-');
+        if ($yilText !== '-') {
+            $yilText = $yilText . ' йил';
+        }
+        $text .= "📆 <b>Йил:</b> " . $yilText . "\n";
+        
+        // Probeg - kirill xarflarda "km" qo'shish
+        $probegText = '-';
+        if ($elon->yurgani) {
+            $probegText = number_format($elon->yurgani, 0, '.', ' ') . ' км';
+        }
+        $text .= "📏 <b>Пробег:</b> " . $probegText . "\n";
+        
+        $text .= "⛽ <b>Ёқилғи:</b> " . htmlspecialchars($elon->yoqilgisi ?? '-') . "\n";
         
         // Narx va valyuta
         if ($elon->narxi) {
             $currencySymbol = $elon->currency === 'dollar' ? '$' : '';
-            $currencyText = $elon->currency === 'dollar' ? '' : ' so\'m';
-            $text .= "💰 <b>Narxi:</b> " . $currencySymbol . number_format($elon->narxi, 0, '.', ' ') . $currencyText . "\n";
+            $currencyText = $elon->currency === 'dollar' ? '' : ' сўм';
+            $text .= "💰 <b>Нархи:</b> " . $currencySymbol . number_format($elon->narxi, 0, '.', ' ') . $currencyText . "\n";
         }
         
-        $text .= "📞 <b>Tel:</b> " . htmlspecialchars($elon->tel_1 ?? '-') . "\n";
+        $text .= "📞 <b>Тел:</b> " . htmlspecialchars($elon->tel_1 ?? '-') . "\n";
         if ($elon->tel_2) {
-            $text .= "📞 <b>Tel 2:</b> " . htmlspecialchars($elon->tel_2) . "\n";
+            $text .= "📞 <b>Тел 2:</b> " . htmlspecialchars($elon->tel_2) . "\n";
         }
-        $text .= "📍 <b>Manzil:</b> " . htmlspecialchars($elon->manzil ?? '-') . "\n";
+        $text .= "📍 <b>Манзил:</b> " . htmlspecialchars($elon->manzil ?? '-') . "\n";
         
         // Bot username'ni olish
         $botUsername = null;
@@ -145,23 +167,23 @@ class SendElonToChannelJob implements ShouldQueue
             ]);
         }
         
-        // Bot username va eslatma matnini qo'shish (har doim)
+        // Bot username va eslatma matnini qo'shish (har doim) - kirill xarflarda
         $text .= "\n";
         if ($botUsername) {
-            $text .= "Elon berish bepul :\n@" . htmlspecialchars($botUsername) . "\n";
+            $text .= "Элон бериш бepул :\n@" . htmlspecialchars($botUsername) . "\n";
         }
         
-        // Eslatma matni (bold) - har doim qo'shiladi
+        // Eslatma matni (bold) - har doim qo'shiladi - kirill xarflarda
         // HTML tag'larni to'g'ri yopish kerak - har bir qatorni alohida bold qilamiz
-        $text .= "\n<b>⚠️ Eslatma:</b>\n";
-        $text .= "<b>Mashinani ko'rmasdan pul tashlamang.</b>\n";
-        $text .= "<b>Kanal savdoga mas'ul emas.</b>";
+        $text .= "\n<b>⚠️ Эслатма:</b>\n";
+        $text .= "<b>Машинани кўрмасдан пул ташламанг.</b>\n";
+        $text .= "<b>Канал савдога масъул эмас.</b>";
 
         // 1024 belgi limit (Telegram caption limit)
         if (mb_strlen($text) > 1024) {
             // Eslatma matnini qisqartirish
             $mainText = mb_substr($text, 0, mb_strrpos($text, "\n\n"));
-            $text = $mainText . "\n\n<b>⚠️ Eslatma:</b>\n<b>Mashinani ko'rmasdan pul tashlamang.</b>\n<b>Kanal savdoga mas'ul emas.</b>";
+            $text = $mainText . "\n\n<b>⚠️ Эслатма:</b>\n<b>Машинани кўрмасдан пул ташламанг.</b>\n<b>Канал савдога масъул эмас.</b>";
             
             // Agar hali ham uzun bo'lsa, asosiy matnni qisqartirish
             if (mb_strlen($text) > 1024) {

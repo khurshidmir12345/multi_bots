@@ -8,7 +8,6 @@ use App\Models\Elon;
 use App\Models\ElonUser;
 use App\Models\Image;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Telegram\Bot\Api;
 use Telegram\Bot\Objects\Message;
@@ -25,25 +24,64 @@ class ElonService
     }
 
     /**
+     * Admin'ga xatolik xabari yuborish
+     */
+    private function notifyAdminError(string $message, array $context = []): void
+    {
+        try {
+            $adminChatIds = config('elon.admin_chat_ids', []);
+            if (empty($adminChatIds)) {
+                return;
+            }
+
+            $errorText = "⚠️ *Xatolik yuz berdi*\n\n";
+            $errorText .= $message;
+            
+            if (!empty($context)) {
+                $errorText .= "\n\n*Tafsilotlar:*\n";
+                foreach ($context as $key => $value) {
+                    if (is_array($value) || is_object($value)) {
+                        $value = json_encode($value, JSON_UNESCAPED_UNICODE);
+                    }
+                    $errorText .= "• *{$key}*: " . (string)$value . "\n";
+                }
+            }
+
+            foreach ($adminChatIds as $adminChatId) {
+                try {
+                    $this->telegram->sendMessage([
+                        'chat_id' => $adminChatId,
+                        'text' => $errorText,
+                        'parse_mode' => 'Markdown',
+                    ]);
+                } catch (\Exception $e) {
+                    // Admin'ga xabar yuborishda xatolik bo'lsa, hech narsa qilmaymiz
+                }
+            }
+        } catch (\Exception $e) {
+            // Xatolik bo'lsa, hech narsa qilmaymiz
+        }
+    }
+
+    /**
      * Update'ni handle qilish
      */
     public function handleUpdate(Update $update): void
     {
-        Log::info("ElonService: handleUpdate called", [
-            'has_message' => $update->message !== null,
-            'has_callback_query' => $update->callbackQuery !== null,
-        ]);
+        try {
+            if ($update->callbackQuery) {
+                $this->handleCallbackQuery($update->callbackQuery);
+                return;
+            }
 
-        if ($update->callbackQuery) {
-            $this->handleCallbackQuery($update->callbackQuery);
-            return;
-        }
-
-        if ($update->message) {
-            $this->handleMessage($update->message);
-        } else {
-            Log::warning("ElonService: No message in update", [
-                'update_id' => $update->updateId ?? null,
+            if ($update->message) {
+                $this->handleMessage($update->message);
+            }
+        } catch (\Exception $e) {
+            $this->notifyAdminError("Update handle qilishda xatolik", [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
             ]);
         }
     }
@@ -53,17 +91,12 @@ class ElonService
      */
     private function handleMessage(Message $message): void
     {
-        $chatId = $message->chat->id;
-        $text = $message->text ?? '';
-        $photo = $message->photo;
+        try {
+            $chatId = $message->chat->id;
+            $text = $message->text ?? '';
+            $photo = $message->photo;
 
-        Log::info("ElonService: handleMessage called", [
-            'chat_id' => $chatId,
-            'text' => $text,
-            'has_photo' => $photo !== null,
-        ]);
-
-        // User'ni topish yoki yaratish
+            // User'ni topish yoki yaratish
         $user = ElonUser::firstOrCreate(
             ['chat_id' => $chatId],
             [
@@ -95,8 +128,14 @@ class ElonService
             return;
         }
 
-        // Step bo'yicha javob qabul qilish
-        $this->handleStep($user, $message, $text);
+            // Step bo'yicha javob qabul qilish
+            $this->handleStep($user, $message, $text);
+        } catch (\Exception $e) {
+            $this->notifyAdminError("Message handle qilishda xatolik", [
+                'chat_id' => $message->chat->id ?? null,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -321,12 +360,8 @@ class ElonService
                             \App\Jobs\UpdateSoldElonFeedbackJob::dispatch($soldElon->id, $this->bot->id)
                                 ->delay(now()->addSeconds(2));
                             
-                            Log::info("UpdateSoldElonFeedbackJob queued after feedback", [
-                                'elon_id' => $soldElon->id,
-                                'bot_id' => $this->bot->id,
-                            ]);
                         } catch (\Exception $e) {
-                            Log::error("Error queueing UpdateSoldElonFeedbackJob after feedback", [
+                            $this->notifyAdminError("UpdateSoldElonFeedbackJob queue qilishda xatolik", [
                                 'elon_id' => $soldElon->id,
                                 'bot_id' => $this->bot->id,
                                 'error' => $e->getMessage(),
@@ -577,13 +612,17 @@ class ElonService
                 'reply_markup' => json_encode($keyboard),
             ]);
         } catch (\Exception $e) {
-            Log::error("Error sending confirmation with cancel button", [
+            $this->notifyAdminError("Tasdiqlash xabarini yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'elon_id' => $elon->id,
                 'error' => $e->getMessage(),
             ]);
             // Xatolik bo'lsa, button'siz yuborish
-            $this->sendMessage($chatId, $text);
+            try {
+                $this->sendMessage($chatId, $text);
+            } catch (\Exception $e2) {
+                // Xatolik bo'lsa, hech narsa qilmaymiz
+            }
         }
     }
 
@@ -595,7 +634,6 @@ class ElonService
         $adminChatIds = config('elon.admin_chat_ids', []);
         
         if (empty($adminChatIds)) {
-            Log::warning("No admin chat IDs configured");
             return;
         }
 
@@ -614,7 +652,7 @@ class ElonService
                     $this->sendMessageWithButtons((int) $adminChatId, $elonText, $elon->id);
                 }
             } catch (\Exception $e) {
-                Log::error("Error sending elon to admin", [
+                $this->notifyAdminError("Admin'ga elon yuborishda xatolik", [
                     'admin_chat_id' => $adminChatId,
                     'elon_id' => $elon->id,
                     'error' => $e->getMessage(),
@@ -643,15 +681,16 @@ class ElonService
                 $finalCaption = mb_substr($finalCaption, 0, 1020) . '...';
             }
 
-            // Barcha rasmlar file_id bilan bo'lsa, SDK orqali yuborish
-            $allHaveFileId = $images->every(function ($image) {
+            // Avval file_id'lar borligini tekshirish va ularni ustuvor qilish
+            $imagesWithFileId = $images->filter(function ($image) {
                 return !empty($image->file_id);
             });
 
-            if ($allHaveFileId && $imageCount > 1) {
+            // Agar barcha rasmlar file_id bilan bo'lsa, SDK orqali yuborish
+            if ($imagesWithFileId->count() === $imageCount && $imageCount > 1) {
                 // SDK orqali media group yuborish (file_id bilan)
                 $media = [];
-                foreach ($images as $index => $image) {
+                foreach ($imagesWithFileId as $index => $image) {
                     if ($index < 10) { // Telegram maksimum 10 ta rasm qabul qiladi
                         $media[] = [
                             'type' => 'photo',
@@ -664,22 +703,50 @@ class ElonService
                     $media[0]['caption'] = $finalCaption;
                     $media[0]['parse_mode'] = 'Markdown';
                     
-                    $this->telegram->sendMediaGroup([
-                        'chat_id' => $chatId,
-                        'media' => json_encode($media),
-                    ]);
-                    return;
+                    try {
+                        $this->telegram->sendMediaGroup([
+                            'chat_id' => $chatId,
+                            'media' => json_encode($media),
+                        ]);
+                        return;
+                    } catch (\Exception $e) {
+                        // Agar SDK orqali xatolik bo'lsa, to'g'ridan-to'g'ri yuborishga o'tamiz
+                    }
                 }
             }
 
-            // Agar file_id bo'lmasa yoki bitta rasm bo'lsa, to'g'ridan-to'g'ri HTTP request yuborish
+            // Agar bitta rasm bo'lsa va file_id bor bo'lsa, sendPhoto ishlatish
+            if ($imageCount === 1) {
+                $image = $images->first();
+                if ($image->file_id) {
+                    try {
+                        $photoCaption = !empty($finalCaption) ? $finalCaption : "📸 *Elon rasmi*";
+                        if (mb_strlen($photoCaption) > 1024) {
+                            $photoCaption = mb_substr($photoCaption, 0, 1020) . '...';
+                        }
+                        
+                        $this->telegram->sendPhoto([
+                            'chat_id' => $chatId,
+                            'photo' => $image->file_id,
+                            'caption' => $photoCaption,
+                            'parse_mode' => 'Markdown',
+                        ]);
+                        return;
+                    } catch (\Exception $e) {
+                        // Agar xatolik bo'lsa, to'g'ridan-to'g'ri yuborishga o'tamiz
+                        $this->sendMediaGroupDirect($chatId, $images, $finalCaption);
+                        return;
+                    }
+                }
+            }
+
+            // Agar file_id bo'lmasa yoki ko'p rasm bo'lsa, to'g'ridan-to'g'ri HTTP request yuborish
             $this->sendMediaGroupDirect($chatId, $images, $finalCaption);
             
         } catch (\Exception $e) {
-            Log::error("Error sending images to admin", [
+            $this->notifyAdminError("Admin'ga rasmlar yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
             ]);
         }
     }
@@ -738,14 +805,10 @@ class ElonService
                                 'filename' => basename($image->s3_path),
                             ];
                         } else {
-                            Log::warning("Failed to open temp file for media group", [
-                                'image_id' => $image->id,
-                                's3_path' => $image->s3_path,
-                            ]);
                             continue;
                         }
                     } catch (\Exception $e) {
-                        Log::error("Error getting file from S3", [
+                        $this->notifyAdminError("S3'dan fayl olishda xatolik", [
                             'image_id' => $image->id,
                             's3_path' => $image->s3_path,
                             'error' => $e->getMessage(),
@@ -767,13 +830,10 @@ class ElonService
             }
             
             if (empty($media)) {
-                Log::warning("No valid media items for media group", [
-                    'chat_id' => $chatId,
-                ]);
                 return;
             }
             
-            // Birinchi rasmga caption qo'shish
+            // Birinchi rasmga caption qo'shish (har doim)
             if (count($media) > 0 && !empty($caption)) {
                 // Telegram caption limit: 1024 belgi
                 $finalCaption = mb_strlen($caption) > 1024 ? mb_substr($caption, 0, 1020) . '...' : $caption;
@@ -787,75 +847,82 @@ class ElonService
                 'contents' => json_encode($media),
             ];
             
-            // Agar bitta rasm bo'lsa, oddiy sendPhoto ishlatish
+            // Agar bitta rasm bo'lsa va file_id yoki URL bo'lsa, oddiy sendPhoto ishlatish
             if ($validImages === 1) {
-                // File handle'larni yopish
-                foreach ($fileHandles as $handle) {
-                    fclose($handle);
-                }
-                
                 $image = $images->first();
                 $photo = null;
                 
+                // Faqat file_id yoki URL bo'lsa, sendPhoto ishlatamiz
                 if ($image->file_id) {
                     $photo = $image->file_id;
                 } elseif ($image->s3_url) {
                     $photo = $image->s3_url;
-                } elseif ($image->s3_path && Storage::disk('s3')->exists($image->s3_path)) {
-                    // S3'dan faylni yuklab olish
-                    try {
-                        $fileContent = Storage::disk('s3')->get($image->s3_path);
-                        $tempFile = tmpfile();
-                        $tempPath = stream_get_meta_data($tempFile)['uri'];
-                        file_put_contents($tempPath, $fileContent);
-                        $photo = $tempPath;
-                    } catch (\Exception $e) {
-                        Log::error("Error getting file from S3 for single photo", [
-                            'image_id' => $image->id,
-                            's3_path' => $image->s3_path,
-                            'error' => $e->getMessage(),
-                        ]);
-                        $photo = $image->image_url;
-                    }
                 } elseif ($image->image_url) {
                     $photo = $image->image_url;
                 }
                 
-                if ($photo) {
+                // Agar file_id yoki URL bo'lsa, sendPhoto ishlatish
+                if ($photo && ($image->file_id || $image->s3_url || $image->image_url)) {
+                    // File handle'larni yopish
+                    foreach ($fileHandles as $handle) {
+                        fclose($handle);
+                    }
+                    
                     $photoCaption = !empty($caption) ? $caption : "📸 *Elon rasmi*";
                     // Telegram caption limit: 1024 belgi
                     if (mb_strlen($photoCaption) > 1024) {
                         $photoCaption = mb_substr($photoCaption, 0, 1020) . '...';
                     }
                     
-                    $this->telegram->sendPhoto([
+                    try {
+                        $this->telegram->sendPhoto([
+                            'chat_id' => $chatId,
+                            'photo' => $photo,
+                            'caption' => $photoCaption,
+                            'parse_mode' => 'Markdown',
+                        ]);
+                        return;
+                    } catch (\Exception $e) {
+                        // Agar xatolik bo'lsa, media group orqali yuborishga o'tamiz
+                    }
+                }
+                
+                // Agar S3 path bo'lsa yoki xatolik bo'lsa, media group orqali yuboramiz
+                // File handle'larni yopmaslik (media group uchun kerak)
+            }
+            
+            // HTTP request yuborish (media group)
+            try {
+                $response = Http::timeout(60)->asMultipart()->post($apiUrl, $multipart);
+                
+                // File handle'larni yopish
+                foreach ($fileHandles as $handle) {
+                    if (is_resource($handle)) {
+                        fclose($handle);
+                    }
+                }
+                
+                if (!$response->successful()) {
+                    $responseBody = $response->body();
+                    $this->notifyAdminError("Media group yuborishda xatolik", [
                         'chat_id' => $chatId,
-                        'photo' => $photo,
-                        'caption' => $photoCaption,
-                        'parse_mode' => 'Markdown',
+                        'status' => $response->status(),
+                        'response' => $responseBody,
+                        'media_count' => count($media),
                     ]);
                 }
-                return;
-            }
-            
-            // HTTP request yuborish
-            $response = Http::asMultipart()->post($apiUrl, $multipart);
-            
-            // File handle'larni yopish
-            foreach ($fileHandles as $handle) {
-                fclose($handle);
-            }
-            
-            if ($response->successful()) {
-                Log::info("Media group sent successfully to admin", [
+            } catch (\Exception $e) {
+                // File handle'larni yopish (xatolik bo'lsa ham)
+                foreach ($fileHandles as $handle) {
+                    if (is_resource($handle)) {
+                        fclose($handle);
+                    }
+                }
+                
+                $this->notifyAdminError("Media group HTTP request xatolik", [
                     'chat_id' => $chatId,
-                    'count' => count($media),
-                ]);
-            } else {
-                Log::error("Failed to send media group to admin", [
-                    'chat_id' => $chatId,
-                    'status' => $response->status(),
-                    'response' => $response->body(),
+                    'error' => $e->getMessage(),
+                    'media_count' => count($media),
                 ]);
             }
         } catch (\Exception $e) {
@@ -866,10 +933,9 @@ class ElonService
                 }
             }
             
-            Log::error("Error sending media group directly", [
+            $this->notifyAdminError("Media group to'g'ridan-to'g'ri yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
             ]);
         }
     }
@@ -944,7 +1010,7 @@ class ElonService
                 'reply_markup' => json_encode($keyboard),
             ]);
         } catch (\Exception $e) {
-            Log::error("Error sending message with buttons", [
+            $this->notifyAdminError("Button'li xabar yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
             ]);
@@ -979,7 +1045,7 @@ class ElonService
                 'reply_markup' => json_encode($keyboard),
             ]);
         } catch (\Exception $e) {
-            Log::error("Error sending buttons only", [
+            $this->notifyAdminError("Button'lar yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
             ]);
@@ -993,55 +1059,86 @@ class ElonService
     {
         $chatId = $callbackQuery->from->id;
         $data = $callbackQuery->data;
-        $messageId = $callbackQuery->message->messageId;
+        $messageId = $callbackQuery->message->messageId ?? null;
+        $callbackQueryId = $callbackQuery->id;
+
+        // Avval callback query'ga darhol javob berish (timeout'ni oldini olish uchun)
+        try {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => '',
+            ]);
+        } catch (\Exception $e) {
+            // Agar javob berishda xatolik bo'lsa ham, ishni davom ettiramiz
+        }
 
         // Callback data'ni parse qilish
-        if (str_starts_with($data, 'elon_accept_')) {
-            // Admin callback'lar uchun tekshirish
-            $adminChatIds = config('elon.admin_chat_ids', []);
-            if (!in_array($chatId, $adminChatIds)) {
+        try {
+            if (str_starts_with($data, 'elon_accept_')) {
+                // Admin callback'lar uchun tekshirish
+                $adminChatIds = config('elon.admin_chat_ids', []);
+                if (!in_array($chatId, $adminChatIds)) {
+                    $this->telegram->answerCallbackQuery([
+                        'callback_query_id' => $callbackQueryId,
+                        'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
+                        'show_alert' => true,
+                    ]);
+                    return;
+                }
+                $elonId = (int) str_replace('elon_accept_', '', $data);
+                $this->handleAdminAccept($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif (str_starts_with($data, 'elon_reject_')) {
+                // Admin callback'lar uchun tekshirish
+                $adminChatIds = config('elon.admin_chat_ids', []);
+                if (!in_array($chatId, $adminChatIds)) {
+                    $this->telegram->answerCallbackQuery([
+                        'callback_query_id' => $callbackQueryId,
+                        'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
+                        'show_alert' => true,
+                    ]);
+                    return;
+                }
+                $elonId = (int) str_replace('elon_reject_', '', $data);
+                $this->handleAdminReject($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif (str_starts_with($data, 'elon_cancel_user_')) {
+                // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+                $elonId = (int) str_replace('elon_cancel_user_', '', $data);
+                $this->handleUserCancel($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif (str_starts_with($data, 'elon_finish_images_')) {
+                // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+                $elonId = (int) str_replace('elon_finish_images_', '', $data);
+                $this->handleFinishImages($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif (str_starts_with($data, 'elon_confirm_yes_')) {
+                // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+                $elonId = (int) str_replace('elon_confirm_yes_', '', $data);
+                $this->handleConfirmYes($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif (str_starts_with($data, 'elon_confirm_no_')) {
+                // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+                $elonId = (int) str_replace('elon_confirm_no_', '', $data);
+                $this->handleConfirmNo($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif (str_starts_with($data, 'elon_sold_')) {
+                // Foydalanuvchi callback'i - admin tekshiruvi yo'q
+                $elonId = (int) str_replace('elon_sold_', '', $data);
+                $this->handleUserSold($chatId, $elonId, $callbackQueryId, $messageId);
+            }
+        } catch (\Exception $e) {
+            $this->notifyAdminError("Callback query handle qilishda xatolik", [
+                'callback_query_id' => $callbackQueryId,
+                'data' => $data,
+                'chat_id' => $chatId,
+                'error' => $e->getMessage(),
+            ]);
+            
+            // Xatolik bo'lsa ham, foydalanuvchiga xabar berishga harakat qilish
+            try {
                 $this->telegram->answerCallbackQuery([
-                    'callback_query_id' => $callbackQuery->id,
-                    'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
+                    'callback_query_id' => $callbackQueryId,
+                    'text' => 'Xatolik yuz berdi. Iltimos, qayta urinib ko\'ring.',
                     'show_alert' => true,
                 ]);
-                return;
+            } catch (\Exception $e2) {
+                // Xatolik bo'lsa, hech narsa qilmaymiz
             }
-            $elonId = (int) str_replace('elon_accept_', '', $data);
-            $this->handleAdminAccept($chatId, $elonId, $callbackQuery->id, $messageId);
-        } elseif (str_starts_with($data, 'elon_reject_')) {
-            // Admin callback'lar uchun tekshirish
-            $adminChatIds = config('elon.admin_chat_ids', []);
-            if (!in_array($chatId, $adminChatIds)) {
-                $this->telegram->answerCallbackQuery([
-                    'callback_query_id' => $callbackQuery->id,
-                    'text' => 'Sizda bu amalni bajarish huquqi yo\'q!',
-                    'show_alert' => true,
-                ]);
-                return;
-            }
-            $elonId = (int) str_replace('elon_reject_', '', $data);
-            $this->handleAdminReject($chatId, $elonId, $callbackQuery->id, $messageId);
-        } elseif (str_starts_with($data, 'elon_cancel_user_')) {
-            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
-            $elonId = (int) str_replace('elon_cancel_user_', '', $data);
-            $this->handleUserCancel($chatId, $elonId, $callbackQuery->id, $messageId);
-        } elseif (str_starts_with($data, 'elon_finish_images_')) {
-            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
-            $elonId = (int) str_replace('elon_finish_images_', '', $data);
-            $this->handleFinishImages($chatId, $elonId, $callbackQuery->id, $messageId);
-        } elseif (str_starts_with($data, 'elon_confirm_yes_')) {
-            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
-            $elonId = (int) str_replace('elon_confirm_yes_', '', $data);
-            $this->handleConfirmYes($chatId, $elonId, $callbackQuery->id, $messageId);
-        } elseif (str_starts_with($data, 'elon_confirm_no_')) {
-            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
-            $elonId = (int) str_replace('elon_confirm_no_', '', $data);
-            $this->handleConfirmNo($chatId, $elonId, $callbackQuery->id, $messageId);
-        } elseif (str_starts_with($data, 'elon_sold_')) {
-            // Foydalanuvchi callback'i - admin tekshiruvi yo'q
-            $elonId = (int) str_replace('elon_sold_', '', $data);
-            $this->handleUserSold($chatId, $elonId, $callbackQuery->id, $messageId);
         }
     }
 
@@ -1050,125 +1147,156 @@ class ElonService
      */
     private function handleAdminAccept(int $adminChatId, int $elonId, string $callbackQueryId, int $messageId): void
     {
-        $elon = Elon::find($elonId);
-        
-        if (!$elon) {
-            $this->telegram->answerCallbackQuery([
-                'callback_query_id' => $callbackQueryId,
-                'text' => 'Elon topilmadi!',
-                'show_alert' => true,
-            ]);
-            return;
-        }
-
-        // Agar allaqachon tasdiqlangan bo'lsa
-        if ($elon->status === Elon::STATUS_ACCEPTED_ADMIN || $elon->status === Elon::STATUS_COMPLATED) {
-            $this->telegram->answerCallbackQuery([
-                'callback_query_id' => $callbackQueryId,
-                'text' => 'Bu elon allaqachon tasdiqlangan!',
-                'show_alert' => true,
-            ]);
-            return;
-        }
-
-        // Agar foydalanuvchi tomonidan bekor qilingan bo'lsa, kanalga yuborilmaydi
-        if ($elon->cancelled_from_user) {
-            $this->telegram->answerCallbackQuery([
-                'callback_query_id' => $callbackQueryId,
-                'text' => 'Bu elon foydalanuvchi tomonidan bekor qilingan!',
-                'show_alert' => true,
-            ]);
-            
-            // Xabarni yangilash
-            $text = $this->formatElonForAdmin($elon);
-            $text .= "\n\n❌ *Foydalanuvchi tomonidan bekor qilingan*";
-            
-            $this->telegram->editMessageText([
-                'chat_id' => $adminChatId,
-                'message_id' => $messageId,
-                'text' => $text,
-                'parse_mode' => 'Markdown',
-            ]);
-            
-            Log::info("Elon not sent to channel - cancelled by user", [
-                'elon_id' => $elonId,
-                'admin_chat_id' => $adminChatId,
-            ]);
-            return;
-        }
-
-        // Elon statusini yangilash
-        $elon->status = Elon::STATUS_ACCEPTED_ADMIN;
-        $elon->save();
-
-        // Callback query'ga javob
-        $this->telegram->answerCallbackQuery([
-            'callback_query_id' => $callbackQueryId,
-            'text' => 'Elon tasdiqlandi! ✅',
-        ]);
-
-        // Xabarni yangilash
-        $text = $this->formatElonForAdmin($elon);
-        $text .= "\n\n✅ *Tasdiqlangan* (Admin ID: {$adminChatId})";
-
-        $this->telegram->editMessageText([
-            'chat_id' => $adminChatId,
-            'message_id' => $messageId,
-            'text' => $text,
-            'parse_mode' => 'Markdown',
-        ]);
-
-        // Queue'ga qo'yish (vaqt olmasligi uchun)
         try {
-            SendElonToChannelJob::dispatch($elon->id, $this->bot->id);
+            $elon = Elon::find($elonId);
             
-            Log::info("Elon queued to channel after admin acceptance", [
-                'elon_id' => $elonId,
-                'bot_id' => $this->bot->id,
-            ]);
-        } catch (\Exception $e) {
-            Log::error("Error queueing elon to channel after admin acceptance", [
-                'elon_id' => $elonId,
-                'bot_id' => $this->bot->id,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
-        }
+            if (!$elon) {
+                try {
+                    $this->telegram->answerCallbackQuery([
+                        'callback_query_id' => $callbackQueryId,
+                        'text' => 'Elon topilmadi!',
+                        'show_alert' => true,
+                    ]);
+                } catch (\Exception $e) {
+                    // Xatolik bo'lsa, hech narsa qilmaymiz
+                }
+                return;
+            }
 
-        // Foydalanuvchiga xabar yuborish (button bilan)
-        if ($elon->elonUser) {
-            $userText = "✅ *Elon tasdiqlandi!*\n\n";
-            $userText .= "Elon ID: #{$elon->id}\n\n";
-            $userText .= "Elon kanalga yuborildi.\n\n";
-            $userText .= "Agar elonni bekor qilmoqchi bo'lsangiz yoki moshina sotilgan bo'lsa, quyidagi tugmalardan birini bosing.";
-            
-            $keyboard = [
-                'inline_keyboard' => [
-                    [
-                        [
-                            'text' => '❌ Elonni bekor qilish',
-                            'callback_data' => "elon_cancel_user_{$elon->id}"
-                        ],
-                        [
-                            'text' => '✅ Moshina sotildi',
-                            'callback_data' => "elon_sold_{$elon->id}"
+            // Agar allaqachon tasdiqlangan bo'lsa
+            if ($elon->status === Elon::STATUS_ACCEPTED_ADMIN || $elon->status === Elon::STATUS_COMPLATED) {
+                try {
+                    $this->telegram->answerCallbackQuery([
+                        'callback_query_id' => $callbackQueryId,
+                        'text' => 'Bu elon allaqachon tasdiqlangan!',
+                        'show_alert' => true,
+                    ]);
+                } catch (\Exception $e) {
+                    // Xatolik bo'lsa, hech narsa qilmaymiz
+                }
+                return;
+            }
+
+            // Agar foydalanuvchi tomonidan bekor qilingan bo'lsa, kanalga yuborilmaydi
+            if ($elon->cancelled_from_user) {
+                try {
+                    $this->telegram->answerCallbackQuery([
+                        'callback_query_id' => $callbackQueryId,
+                        'text' => 'Bu elon foydalanuvchi tomonidan bekor qilingan!',
+                        'show_alert' => true,
+                    ]);
+                    
+                    // Xabarni yangilash (background'da)
+                    $text = $this->formatElonForAdmin($elon);
+                    $text .= "\n\n❌ *Foydalanuvchi tomonidan bekor qilingan*";
+                    
+                    try {
+                        $this->telegram->editMessageText([
+                            'chat_id' => $adminChatId,
+                            'message_id' => $messageId,
+                            'text' => $text,
+                            'parse_mode' => 'Markdown',
+                        ]);
+                    } catch (\Exception $e) {
+                        // Xatolik bo'lsa, hech narsa qilmaymiz
+                    }
+                } catch (\Exception $e) {
+                    // Xatolik bo'lsa, hech narsa qilmaymiz
+                }
+                return;
+            }
+
+            // Elon statusini yangilash (darhol)
+            $elon->status = Elon::STATUS_ACCEPTED_ADMIN;
+            $elon->save();
+
+            // Callback query'ga darhol javob (o'ylanmaslik uchun)
+            try {
+                $this->telegram->answerCallbackQuery([
+                    'callback_query_id' => $callbackQueryId,
+                    'text' => 'Elon tasdiqlandi! ✅',
+                ]);
+            } catch (\Exception $e) {
+                // Xatolik bo'lsa, hech narsa qilmaymiz
+            }
+
+            // Xabarni yangilash (background'da, xatolik bo'lsa ham davom etadi)
+            try {
+                $text = $this->formatElonForAdmin($elon);
+                $text .= "\n\n✅ *Tasdiqlangan* (Admin ID: {$adminChatId})";
+
+                $this->telegram->editMessageText([
+                    'chat_id' => $adminChatId,
+                    'message_id' => $messageId,
+                    'text' => $text,
+                    'parse_mode' => 'Markdown',
+                ]);
+            } catch (\Exception $e) {
+                // Xatolik bo'lsa, hech narsa qilmaymiz
+            }
+
+            // Queue'ga qo'yish (background'da)
+            try {
+                SendElonToChannelJob::dispatch($elon->id, $this->bot->id);
+            } catch (\Exception $e) {
+                $this->notifyAdminError("Kanalga elon queue qilishda xatolik", [
+                    'elon_id' => $elonId,
+                    'bot_id' => $this->bot->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            // Foydalanuvchiga xabar yuborish (background'da)
+            if ($elon->elonUser) {
+                try {
+                    $userText = "✅ *Elon tasdiqlandi!*\n\n";
+                    $userText .= "Elon ID: #{$elon->id}\n\n";
+                    $userText .= "Elon kanalga yuborildi.\n\n";
+                    $userText .= "Agar elonni bekor qilmoqchi bo'lsangiz yoki moshina sotilgan bo'lsa, quyidagi tugmalardan birini bosing.";
+                    
+                    $keyboard = [
+                        'inline_keyboard' => [
+                            [
+                                [
+                                    'text' => '❌ Elonni bekor qilish',
+                                    'callback_data' => "elon_cancel_user_{$elon->id}"
+                                ],
+                                [
+                                    'text' => '✅ Moshina sotildi',
+                                    'callback_data' => "elon_sold_{$elon->id}"
+                                ]
+                            ]
                         ]
-                    ]
-                ]
-            ];
-            
-            $this->telegram->sendMessage([
-                'chat_id' => $elon->elonUser->chat_id,
-                'text' => $userText,
-                'parse_mode' => 'Markdown',
-                'reply_markup' => json_encode($keyboard),
+                    ];
+                    
+                    $this->telegram->sendMessage([
+                        'chat_id' => $elon->elonUser->chat_id,
+                        'text' => $userText,
+                        'parse_mode' => 'Markdown',
+                        'reply_markup' => json_encode($keyboard),
+                    ]);
+                } catch (\Exception $e) {
+                    // Xatolik bo'lsa, hech narsa qilmaymiz
+                }
+            }
+        } catch (\Exception $e) {
+            $this->notifyAdminError("Admin accept handle qilishda xatolik", [
+                'admin_chat_id' => $adminChatId,
+                'elon_id' => $elonId,
+                'error' => $e->getMessage(),
             ]);
+            
+            // Xatolik bo'lsa ham, callback query'ga javob berishga harakat qilish
+            try {
+                $this->telegram->answerCallbackQuery([
+                    'callback_query_id' => $callbackQueryId,
+                    'text' => 'Xatolik yuz berdi. Iltimos, qayta urinib ko\'ring.',
+                    'show_alert' => true,
+                ]);
+            } catch (\Exception $e2) {
+                // Xatolik bo'lsa, hech narsa qilmaymiz
+            }
         }
-
-        Log::info("Elon accepted by admin", [
-            'elon_id' => $elonId,
-            'admin_chat_id' => $adminChatId,
-        ]);
     }
 
     /**
@@ -1217,10 +1345,6 @@ class ElonService
             $this->sendMessage($elon->elonUser->chat_id, $userText);
         }
 
-        Log::info("Elon rejected by admin", [
-            'elon_id' => $elonId,
-            'admin_chat_id' => $adminChatId,
-        ]);
     }
 
     /**
@@ -1292,10 +1416,6 @@ class ElonService
             'parse_mode' => 'Markdown',
         ]);
 
-        Log::info("Elon cancelled by user", [
-            'elon_id' => $elonId,
-            'user_chat_id' => $userChatId,
-        ]);
     }
 
     /**
@@ -1373,13 +1493,8 @@ class ElonService
         if ($elon->elon_message_id) {
             try {
                 \App\Jobs\UpdateSoldElonJob::dispatch($elon->id, $this->bot->id);
-                
-                Log::info("UpdateSoldElonJob queued (for hashtag)", [
-                    'elon_id' => $elonId,
-                    'bot_id' => $this->bot->id,
-                ]);
             } catch (\Exception $e) {
-                Log::error("Error queueing UpdateSoldElonJob", [
+                $this->notifyAdminError("UpdateSoldElonJob queue qilishda xatolik", [
                     'elon_id' => $elonId,
                     'bot_id' => $this->bot->id,
                     'error' => $e->getMessage(),
@@ -1387,10 +1502,6 @@ class ElonService
             }
         }
 
-        Log::info("Elon marked as sold by user, waiting for feedback", [
-            'elon_id' => $elonId,
-            'user_chat_id' => $userChatId,
-        ]);
     }
 
     /**
@@ -1403,7 +1514,7 @@ class ElonService
             $response = Http::timeout(30)->get($fileUrl);
             
             if (!$response->successful()) {
-                Log::error("Failed to download image from Telegram", [
+                $this->notifyAdminError("Telegram'dan rasm yuklab olishda xatolik", [
                     'file_url' => $fileUrl,
                     'file_path' => $filePath,
                     'status' => $response->status(),
@@ -1414,7 +1525,7 @@ class ElonService
             $imageContent = $response->body();
             
             if (empty($imageContent)) {
-                Log::error("Empty image content downloaded", [
+                $this->notifyAdminError("Yuklangan rasm bo'sh", [
                     'file_url' => $fileUrl,
                     'file_path' => $filePath,
                 ]);
@@ -1438,22 +1549,15 @@ class ElonService
             $awsUrl = config('filesystems.disks.s3.url', '');
             $s3Url = $awsUrl ? rtrim($awsUrl, '/') . '/' . $storagePath : null;
 
-            Log::info("Image saved to S3", [
-                'elon_id' => $elonId,
-                's3_path' => $storagePath,
-                's3_url' => $s3Url,
-            ]);
-
             return [
                 's3_path' => $storagePath,
                 's3_url' => $s3Url,
             ];
         } catch (\Exception $e) {
-            Log::error("Error downloading and saving image to S3", [
+            $this->notifyAdminError("Rasmni S3'ga saqlashda xatolik", [
                 'file_url' => $fileUrl,
                 'file_path' => $filePath,
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
             ]);
             return ['s3_path' => null, 's3_url' => null];
         }
@@ -1483,7 +1587,7 @@ class ElonService
                 'reply_markup' => json_encode($keyboard),
             ]);
         } catch (\Exception $e) {
-            Log::error("Error sending message with finish button", [
+            $this->notifyAdminError("Tugatish button'li xabar yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
             ]);
@@ -1518,7 +1622,7 @@ class ElonService
                 'reply_markup' => json_encode($keyboard),
             ]);
         } catch (\Exception $e) {
-            Log::error("Error sending message with confirm buttons", [
+            $this->notifyAdminError("Tasdiqlash button'li xabar yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
             ]);
@@ -1566,11 +1670,15 @@ class ElonService
         $user->current_step = 'confirm';
         $user->save();
 
-        // Callback query'ga javob
-        $this->telegram->answerCallbackQuery([
-            'callback_query_id' => $callbackQueryId,
-            'text' => 'Rasmlar tugatildi! ✅',
-        ]);
+        // Callback query'ga javob (agar hali javob berilmagan bo'lsa)
+        try {
+            $this->telegram->answerCallbackQuery([
+                'callback_query_id' => $callbackQueryId,
+                'text' => 'Rasmlar tugatildi! ✅',
+            ]);
+        } catch (\Exception $e) {
+            // Xatolik bo'lsa, hech narsa qilmaymiz
+        }
 
         // Xabarni yangilash
         $text = "✅ *Rasmlar tugatildi!*\n\n";
@@ -1586,10 +1694,6 @@ class ElonService
         // Confirm'ga o'tish
         $this->askConfirm($chatId, $elon);
 
-        Log::info("Images finished by user", [
-            'elon_id' => $elonId,
-            'user_chat_id' => $chatId,
-        ]);
     }
 
     /**
@@ -1672,10 +1776,6 @@ class ElonService
         // Foydalanuvchiga tasdiqlash xabari
         $this->sendConfirmation($chatId, $elon);
 
-        Log::info("Elon confirmed and sent by user", [
-            'elon_id' => $elonId,
-            'user_chat_id' => $chatId,
-        ]);
     }
 
     /**
@@ -1752,10 +1852,6 @@ class ElonService
         $this->sendMessage($chatId, "🔄 Qayta tahrirlashni boshlaymiz...");
         $this->askModeli($chatId);
 
-        Log::info("Elon editing restarted by user", [
-            'elon_id' => $elonId,
-            'user_chat_id' => $chatId,
-        ]);
     }
 
     /**
@@ -1776,7 +1872,7 @@ class ElonService
 
             $this->telegram->sendMessage($params);
         } catch (\Exception $e) {
-            Log::error("Error sending message", [
+            $this->notifyAdminError("Xabar yuborishda xatolik", [
                 'chat_id' => $chatId,
                 'error' => $e->getMessage(),
             ]);
