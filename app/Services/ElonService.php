@@ -644,15 +644,15 @@ class ElonService
 
         foreach ($adminChatIds as $adminChatId) {
             try {
-                // Avval rasmlarni elon matni bilan yuborish
                 if ($images->isNotEmpty()) {
-                    $this->sendImagesToAdmin((int) $adminChatId, $images, $elonText);
-                    // Keyin button'lar bilan alohida xabar yuborish
-                    $this->sendButtonsOnly((int) $adminChatId, $elon->id);
-                } else {
-                    // Agar rasm bo'lmasa, faqat text yuborish
-                    $this->sendMessageWithButtons((int) $adminChatId, $elonText, $elon->id);
+                    $this->sendImagesToAdmin((int) $adminChatId, $images);
                 }
+            } catch (\Exception $e) {
+                // Rasmlar yuborilmasa ham davom etamiz
+            }
+
+            try {
+                $this->sendMessageWithButtons((int) $adminChatId, $elonText, $elon->id);
             } catch (\Exception $e) {
                 $this->notifyAdminError("Admin'ga elon yuborishda xatolik", [
                     'admin_chat_id' => $adminChatId,
