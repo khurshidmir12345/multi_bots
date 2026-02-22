@@ -96,8 +96,7 @@ class ElonService
             $text = $message->text ?? '';
             $photo = $message->photo;
 
-            // User'ni topish yoki yaratish
-        $user = ElonUser::firstOrCreate(
+            $user = ElonUser::firstOrCreate(
             ['chat_id' => $chatId],
             [
                 'name' => $message->from->firstName ?? '',
@@ -106,13 +105,16 @@ class ElonService
             ]
         );
 
-        // Agar user name yoki username o'zgarsa, yangilash
+        $needsUpdate = false;
         if ($message->from->firstName && $user->name !== $message->from->firstName) {
             $user->name = $message->from->firstName;
-            $user->save();
+            $needsUpdate = true;
         }
         if ($message->from->username && $user->user_name !== $message->from->username) {
             $user->user_name = $message->from->username;
+            $needsUpdate = true;
+        }
+        if ($needsUpdate) {
             $user->save();
         }
 
