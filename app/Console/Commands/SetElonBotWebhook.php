@@ -40,7 +40,7 @@ class SetElonBotWebhook extends Command
 
         // Webhook URL'ni aniqlash
         $webhookUrl = $this->argument('url') 
-            ?: 'https://50af2cd8a27c.ngrok-free.app/api/bot/elon_bot/elon/webhook';
+            ?: rtrim(config('app.url'), '/') . '/api/bot/' . $bot->slug . '/elon/webhook';
 
         $this->info("Webhook URL: {$webhookUrl}");
 
