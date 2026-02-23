@@ -145,15 +145,27 @@ class ElonService
      */
     private function handleStart(ElonUser $user, Message $message): void
     {
-        $user->current_step = 'modeli';
+        $user->current_step = 'choose_mode';
         $user->save();
 
         $text = "🚗 *Yangi elon yaratish*\n\n";
-        $text .= "Salom! Mashina eloni yaratish uchun quyidagi ma'lumotlarni to'ldiring.\n\n";
-        $text .= "Har bir savolga javob bering va elonni muvaffaqiyatli yuboring! ✨";
+        $text .= "Salom! Mashina eloni yaratish usulini tanlang:";
 
-        $this->sendMessage($message->chat->id, $text);
-        $this->askModeli($message->chat->id);
+        $keyboard = [
+            'inline_keyboard' => [
+                [
+                    ['text' => '📋 Shablon to\'ldirish', 'callback_data' => 'elon_mode_template'],
+                    ['text' => '💬 Savol-javob', 'callback_data' => 'elon_mode_questions'],
+                ]
+            ]
+        ];
+
+        $this->telegram->sendMessage([
+            'chat_id' => $message->chat->id,
+            'text' => $text,
+            'parse_mode' => 'Markdown',
+            'reply_markup' => json_encode($keyboard),
+        ]);
     }
 
     /**
@@ -163,8 +175,13 @@ class ElonService
     {
         $step = $user->current_step;
 
-        if (!$step || $step === 'start') {
+        if (!$step || $step === 'start' || $step === 'choose_mode') {
             $this->handleStart($user, $message);
+            return;
+        }
+
+        if ($step === 'template') {
+            $this->handleTemplate($user, $message, $text);
             return;
         }
 
@@ -1119,9 +1136,12 @@ class ElonService
                 $elonId = (int) str_replace('elon_confirm_no_', '', $data);
                 $this->handleConfirmNo($chatId, $elonId, $callbackQueryId, $messageId);
             } elseif (str_starts_with($data, 'elon_sold_')) {
-                // Foydalanuvchi callback'i - admin tekshiruvi yo'q
                 $elonId = (int) str_replace('elon_sold_', '', $data);
                 $this->handleUserSold($chatId, $elonId, $callbackQueryId, $messageId);
+            } elseif ($data === 'elon_mode_template') {
+                $this->handleModeTemplate($chatId, $messageId);
+            } elseif ($data === 'elon_mode_questions') {
+                $this->handleModeQuestions($chatId, $messageId);
             }
         } catch (\Exception $e) {
             $this->notifyAdminError("Callback query handle qilishda xatolik", [
@@ -1856,9 +1876,177 @@ class ElonService
 
     }
 
-    /**
-     * Xabar yuborish
-     */
+    private function handleModeTemplate(int $chatId, int $messageId): void
+    {
+        $user = ElonUser::where('chat_id', $chatId)->first();
+        if ($user) {
+            $user->current_step = 'template';
+            $user->save();
+        }
+
+        $this->telegram->editMessageText([
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => "📋 *Shablon to'ldirish* tanlandi",
+            'parse_mode' => 'Markdown',
+        ]);
+
+        $template = "📋 Quyidagi shablonni nusxa oling, to'ldiring va yuboring:\n\n";
+        $template .= "Model: \n";
+        $template .= "Pozitsiya: \n";
+        $template .= "Rang: \n";
+        $template .= "Kraska: \n";
+        $template .= "Yil: \n";
+        $template .= "Yurgani (km): \n";
+        $template .= "Yoqilgi: \n";
+        $template .= "Narx: \n";
+        $template .= "Tel 1: \n";
+        $template .= "Tel 2: \n";
+        $template .= "Manzil: ";
+
+        $this->telegram->sendMessage([
+            'chat_id' => $chatId,
+            'text' => $template,
+        ]);
+    }
+
+    private function handleModeQuestions(int $chatId, int $messageId): void
+    {
+        $user = ElonUser::where('chat_id', $chatId)->first();
+        if ($user) {
+            $user->current_step = 'modeli';
+            $user->save();
+        }
+
+        $this->telegram->editMessageText([
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => "💬 *Savol-javob* tanlandi",
+            'parse_mode' => 'Markdown',
+        ]);
+
+        $this->askModeli($chatId);
+    }
+
+    private function handleTemplate(ElonUser $user, Message $message, string $text): void
+    {
+        $chatId = $message->chat->id;
+
+        $fieldMap = [
+            'model' => 'modeli',
+            'pozitsiya' => 'pozitsiyasi',
+            'rang' => 'rangi',
+            'kraska' => 'kraskasi',
+            'yil' => 'yili',
+            'yurgani' => 'yurgani',
+            'yurgani (km)' => 'yurgani',
+            'yoqilgi' => 'yoqilgisi',
+            'narx' => 'narxi',
+            'tel 1' => 'tel_1',
+            'tel 2' => 'tel_2',
+            'manzil' => 'manzil',
+        ];
+
+        $parsed = [];
+        $lines = explode("\n", $text);
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (empty($line) || !str_contains($line, ':')) {
+                continue;
+            }
+
+            $parts = explode(':', $line, 2);
+            $label = mb_strtolower(trim($parts[0]));
+            $value = trim($parts[1] ?? '');
+
+            if (empty($value)) {
+                continue;
+            }
+
+            if (isset($fieldMap[$label])) {
+                $parsed[$fieldMap[$label]] = $value;
+            }
+        }
+
+        $required = ['modeli', 'pozitsiyasi', 'rangi', 'yili', 'narxi', 'tel_1', 'manzil'];
+        $missing = [];
+        $labelNames = [
+            'modeli' => 'Model',
+            'pozitsiyasi' => 'Pozitsiya',
+            'rangi' => 'Rang',
+            'yili' => 'Yil',
+            'narxi' => 'Narx',
+            'tel_1' => 'Tel 1',
+            'manzil' => 'Manzil',
+        ];
+
+        foreach ($required as $field) {
+            if (empty($parsed[$field])) {
+                $missing[] = $labelNames[$field] ?? $field;
+            }
+        }
+
+        if (!empty($missing)) {
+            $errorText = "❌ Quyidagi maydonlar to'ldirilmagan:\n\n";
+            foreach ($missing as $m) {
+                $errorText .= "• *{$m}*\n";
+            }
+            $errorText .= "\nIltimos, shablonni to'liq to'ldirib qayta yuboring.";
+            $this->sendMessage($chatId, $errorText);
+            return;
+        }
+
+        if (isset($parsed['yili'])) {
+            $yil = (int) $parsed['yili'];
+            if ($yil < 1900 || $yil > date('Y') + 1) {
+                $this->sendMessage($chatId, "❌ Noto'g'ri yil! 1900-" . (date('Y') + 1) . " orasida bo'lishi kerak.");
+                return;
+            }
+            $parsed['yili'] = $yil;
+        }
+
+        if (isset($parsed['yurgani'])) {
+            $parsed['yurgani'] = (int) preg_replace('/[^0-9]/', '', $parsed['yurgani']);
+        }
+
+        $currency = 'so\'m';
+        $narxRaw = $parsed['narxi'];
+        $narxLower = strtolower($narxRaw);
+        if (str_contains($narxLower, '$') || str_contains($narxLower, 'dollar') || str_contains($narxLower, 'usd')) {
+            $currency = 'dollar';
+        }
+        $parsed['narxi'] = (float) preg_replace('/[^0-9.]/', '', $narxRaw);
+        $parsed['currency'] = $currency;
+
+        if ($parsed['narxi'] <= 0) {
+            $this->sendMessage($chatId, "❌ Noto'g'ri narx! Iltimos, to'g'ri narx kiriting.");
+            return;
+        }
+
+        $elon = Elon::create([
+            'elon_user_id' => $user->id,
+            'status' => Elon::STATUS_ACCEPTED_USER,
+            'modeli' => $parsed['modeli'],
+            'pozitsiyasi' => $parsed['pozitsiyasi'] ?? null,
+            'rangi' => $parsed['rangi'] ?? null,
+            'kraskasi' => $parsed['kraskasi'] ?? null,
+            'yili' => $parsed['yili'] ?? null,
+            'yurgani' => $parsed['yurgani'] ?? null,
+            'yoqilgisi' => $parsed['yoqilgisi'] ?? null,
+            'narxi' => $parsed['narxi'],
+            'currency' => $parsed['currency'],
+            'tel_1' => $parsed['tel_1'],
+            'tel_2' => ($parsed['tel_2'] ?? null) !== "Yo'q" ? ($parsed['tel_2'] ?? null) : null,
+            'manzil' => $parsed['manzil'],
+        ]);
+
+        $user->current_step = 'images';
+        $user->save();
+
+        $this->sendMessage($chatId, "✅ Ma'lumotlar qabul qilindi!\n\nEndi mashina rasmlarini yuboring (1-4 ta).");
+    }
+
     private function sendMessage(int $chatId, string $text, ?int $replyToMessageId = null): void
     {
         try {
