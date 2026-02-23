@@ -959,41 +959,47 @@ class ElonService
         }
     }
 
-    /**
-     * Admin uchun elon formatlash
-     */
+    private function escMd(string $text): string
+    {
+        return str_replace(
+            ['_', '*', '`', '['],
+            ['\_', '\*', '\`', '\['],
+            $text
+        );
+    }
+
     private function formatElonForAdmin(Elon $elon): string
     {
+        $e = fn($v) => $this->escMd((string) ($v ?? '-'));
+
         $text = "📋 *Yangi elon*\n\n";
         $text .= "Elon ID: #{$elon->id}\n\n";
         $text .= "*Elon ma'lumotlari:*\n\n";
-        $text .= "🚗 *Model*: " . ($elon->modeli ?? '-') . "\n";
-        $text .= "⚙️ *Pozitsiya*: " . ($elon->pozitsiyasi ?? '-') . "\n";
-        $text .= "🎨 *Rang*: " . ($elon->rangi ?? '-') . "\n";
-        $text .= "🖌️ *Kraskasi*: " . ($elon->kraskasi ?? '-') . "\n";
-        $text .= "📅 *Yil*: " . ($elon->yili ?? '-') . "\n";
-        $text .= "🛣️ *Yurgani*: " . ($elon->yurgani ? number_format($elon->yurgani, 0, '.', ' ') . ' km' : '-') . "\n";
-        $text .= "⛽ *Yoqilg'i*: " . ($elon->yoqilgisi ?? '-') . "\n";
+        $text .= "🚗 *Model*: " . $e($elon->modeli) . "\n";
+        $text .= "⚙️ *Pozitsiya*: " . $e($elon->pozitsiyasi) . "\n";
+        $text .= "🎨 *Rang*: " . $e($elon->rangi) . "\n";
+        $text .= "🖌️ *Kraskasi*: " . $e($elon->kraskasi) . "\n";
+        $text .= "📅 *Yil*: " . $e($elon->yili) . "\n";
+        $text .= "🛣️ *Yurgani*: " . ($elon->yurgani ? $this->escMd(number_format($elon->yurgani, 0, '.', ' ') . ' km') : '-') . "\n";
+        $text .= "⛽ *Yoqilg'i*: " . $e($elon->yoqilgisi) . "\n";
         
-        // Narx va valyuta
         $narxText = '-';
         if ($elon->narxi) {
             $currencySymbol = $elon->currency === 'dollar' ? '$' : '';
             $currencyText = $elon->currency === 'dollar' ? ' dollar' : ' so\'m';
             $narxText = $currencySymbol . number_format($elon->narxi, 0, '.', ' ') . $currencyText;
         }
-        $text .= "💰 *Narx*: " . $narxText . "\n";
+        $text .= "💰 *Narx*: " . $this->escMd($narxText) . "\n";
         
-        $text .= "📞 *Tel 1*: " . ($elon->tel_1 ?? '-') . "\n";
-        $text .= "📞 *Tel 2*: " . ($elon->tel_2 ?? '-') . "\n";
-        $text .= "📍 *Manzil*: " . ($elon->manzil ?? '-') . "\n";
+        $text .= "📞 *Tel 1*: " . $e($elon->tel_1) . "\n";
+        $text .= "📞 *Tel 2*: " . $e($elon->tel_2) . "\n";
+        $text .= "📍 *Manzil*: " . $e($elon->manzil) . "\n";
         $text .= "📸 *Rasmlar*: " . $elon->images()->count() . " ta\n\n";
         
-        // Foydalanuvchi ma'lumotlari
-        $userName = $elon->elonUser->name ?? '-';
+        $userName = $this->escMd($elon->elonUser->name ?? '-');
         $userNameText = $userName;
         if ($elon->elonUser->user_name) {
-            $userNameText .= " (@{$elon->elonUser->user_name})";
+            $userNameText .= " (@" . $this->escMd($elon->elonUser->user_name) . ")";
         }
         $text .= "👤 *Foydalanuvchi*: " . $userNameText . "\n";
         $text .= "🆔 *Chat ID*: " . ($elon->elonUser->chat_id ?? '-') . "\n";

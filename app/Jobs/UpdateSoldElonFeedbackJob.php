@@ -80,7 +80,7 @@ class UpdateSoldElonFeedbackJob implements ShouldQueue
 
             // Elonni update qilish
             $images = $elon->images()->get();
-            
+
             try {
                 if ($images->isNotEmpty()) {
                     // Agar rasm bo'lsa, caption'ni update qilish
@@ -107,7 +107,7 @@ class UpdateSoldElonFeedbackJob implements ShouldQueue
                         'message_id' => $elon->elon_message_id,
                     ]);
                     return; // Job muvaffaqiyatli tugadi
-                } elseif (str_contains($e->getMessage(), 'message to edit not found') || 
+                } elseif (str_contains($e->getMessage(), 'message to edit not found') ||
                           str_contains($e->getMessage(), 'message_id is invalid') ||
                           str_contains($e->getMessage(), 'Bad Request: message to edit not found')) {
                     // Agar message topilmasa, bu xatolik - lekin job tugadi
@@ -145,12 +145,12 @@ class UpdateSoldElonFeedbackJob implements ShouldQueue
     {
         // Eng tepaga #sotildi qo'shish
         $text = "<b>#sotildi</b>\n\n";
-        
+
         // Mijoz tavsifini qo'shish (agar bo'lsa)
         if (!empty($elon->sold_feedback)) {
             $text .= "<b>Mijoz tavsifi:</b> " . htmlspecialchars($elon->sold_feedback) . "\n\n";
         }
-        
+
         $text .= "🚗 <b>Moshina:</b> " . htmlspecialchars($elon->modeli ?? '-') . "\n";
         $text .= "🔧 <b>Karobka:</b> " . htmlspecialchars($elon->pozitsiyasi ?? '-') . "\n";
         $text .= "🎨 <b>Rangi:</b> " . htmlspecialchars($elon->rangi ?? '-') . "\n";
@@ -158,21 +158,21 @@ class UpdateSoldElonFeedbackJob implements ShouldQueue
         $text .= "📆 <b>Yil:</b> " . ($elon->yili ?? '-') . "\n";
         $text .= "📏 <b>Probeg:</b> " . ($elon->yurgani ? number_format($elon->yurgani, 0, '.', ' ') : '-') . "\n";
         $text .= "⛽ <b>Yoqilg'i:</b> " . htmlspecialchars($elon->yoqilgisi ?? '-') . "\n";
-        
+
         // Narx va valyuta
         if ($elon->narxi) {
             $currencySymbol = $elon->currency === 'dollar' ? '$' : '';
             $currencyText = $elon->currency === 'dollar' ? '' : ' so\'m';
             $text .= "💰 <b>Narxi:</b> " . $currencySymbol . number_format($elon->narxi, 0, '.', ' ') . $currencyText . "\n";
         }
-        
+
         // Telefon raqami o'rniga #sotildi
         $text .= "📞 <b>Tel:</b> #sotildi\n";
         if ($elon->tel_2) {
             $text .= "📞 <b>Tel 2:</b> #sotildi\n";
         }
         $text .= "📍 <b>Manzil:</b> " . htmlspecialchars($elon->manzil ?? '-') . "\n";
-        
+
         // Bot username'ni olish
         $botUsername = null;
         try {
@@ -185,7 +185,7 @@ class UpdateSoldElonFeedbackJob implements ShouldQueue
                 'error' => $e->getMessage(),
             ]);
         }
-        
+
         // Bot username qo'shish
         if ($botUsername) {
             $text .= "\nElon berish bepul :\n@" . htmlspecialchars($botUsername);
