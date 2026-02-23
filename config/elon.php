@@ -28,4 +28,6 @@ return [
     */
 
     'sold_sticker_id' => env('ELON_SOLD_STICKER_ID', null),
+
+    'bot_username' => env('ELON_BOT_USERNAME', 'elon_saqla_bot'),
 ];
